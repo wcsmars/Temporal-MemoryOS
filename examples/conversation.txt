@@ -1,0 +1,6 @@
+# Synthetic example: these are invented facts, not personal data.
+2026-09-01: My application at Acme is pending.
+2026-09-15: My application at Acme is interview invited.
+2026-10-01: My application at Acme is interview completed.
+user | preferred_language | English | 2026-09-01
+user | beverage | decaf coffee | 2026-10-01

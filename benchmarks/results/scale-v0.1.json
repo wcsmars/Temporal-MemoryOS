@@ -1,0 +1,51 @@
+{
+  "benchmark": "scale_latency_v1",
+  "label": "v0.1",
+  "version": "0.1.0",
+  "generated_at": "2026-10-23T05:28:23.415189+00:00",
+  "environment": {
+    "python": "3.11.7",
+    "system": "Darwin",
+    "machine": "arm64"
+  },
+  "workload": "Three dated status records per synthetic entity; hybrid search with valid-time and knowledge-time filters; offline lexical embeddings.",
+  "notes": [
+    "Single local run per size; medians over repeated operations.",
+    "Writes are measured after imported files leave the recently-modified window.",
+    "Timings are machine-specific and not comparable across hardware."
+  ],
+  "results": [
+    {
+      "facts": 300,
+      "first_open_ms": 56.222,
+      "open_unchanged_ms": 39.955,
+      "full_rebuild_ms": 39.262,
+      "write_ms_median": 39.153,
+      "search_ms_median": 15.088
+    },
+    {
+      "facts": 1000,
+      "first_open_ms": 123.062,
+      "open_unchanged_ms": 129.927,
+      "full_rebuild_ms": 122.576,
+      "write_ms_median": 127.245,
+      "search_ms_median": 48.064
+    },
+    {
+      "facts": 3000,
+      "first_open_ms": 422.639,
+      "open_unchanged_ms": 395.67,
+      "full_rebuild_ms": 375.642,
+      "write_ms_median": 398.619,
+      "search_ms_median": 148.07
+    },
+    {
+      "facts": 10000,
+      "first_open_ms": 1307.747,
+      "open_unchanged_ms": 1374.13,
+      "full_rebuild_ms": 1351.096,
+      "write_ms_median": 1388.822,
+      "search_ms_median": 500.95
+    }
+  ]
+}

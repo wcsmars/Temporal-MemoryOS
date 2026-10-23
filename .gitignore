@@ -1,0 +1,41 @@
+# Python and tooling
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Local memory stores and derived indexes
+memory-data/
+.memoryos/
+*.sqlite3*
+benchmark-results*.json
+
+# Secrets and private data
+.env
+.env.*
+config.yaml
+config.yml
+credentials/
+private/
+data/raw/
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Manuscripts, slides and their sources stay out of this repository
+paper/
+papers/
+slides/
+*.tex
+*.bib
+*.docx
+*.pdf
+*.pptx
+
+.DS_Store

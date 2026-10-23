@@ -1,0 +1,220 @@
+{
+  "benchmark": "synthetic_temporal_smoke_v2",
+  "generated_at": "2026-10-23T05:25:57.385140+00:00",
+  "corpus": {
+    "state_changes": {
+      "entities": 50,
+      "records": 150,
+      "queries": 150,
+      "description": "Three dated status changes per entity; one query per historical state."
+    },
+    "late_corrections": {
+      "entities": 50,
+      "records": 100,
+      "queries": 100,
+      "description": "One status per entity, corrected later at the same effective date; the same day is queried with knowledge from before and after the correction."
+    }
+  },
+  "semantic_backend": "Default offline lexical hashing; no learned semantic model.",
+  "methods": {
+    "all_records_keyword": "Token overlap over every recorded version; ties prefer the newest record.",
+    "latest_state_keyword": "Token overlap over the latest resolved state only.",
+    "valid_time_only": "The package's hybrid search with as_of but no knowledge cutoff (ablation).",
+    "temporal_hybrid": "The package's hybrid search with as_of and known_at."
+  },
+  "metrics": {
+    "top1_fact_accuracy": "Fraction retrieving the expected version's exact fact ID.",
+    "stale_hit_rate": "Fraction returning the correct entity/attribute but the wrong version; includes future-state and future-knowledge leakage.",
+    "retrieval_coverage": "Fraction with at least one returned result.",
+    "latency": "Warm-process retrieval only; excludes corpus construction and indexing."
+  },
+  "limitations": [
+    "Synthetic exact-entity queries; not a language-model answer-quality benchmark.",
+    "Baselines use token overlap, not trained vector RAG or a tuned production search system.",
+    "All-record baseline breaks equal lexical scores by latest recorded time.",
+    "Dates are provided as structured filters only to the temporal methods.",
+    "These workloads demonstrate temporal filtering by construction; they do not establish general superiority.",
+    "No inference, token-cost, hallucination, statistical-significance, or large-scale claims are made."
+  ],
+  "results": {
+    "state_changes": {
+      "all_records_keyword": {
+        "queries": 150,
+        "correct": 50,
+        "top1_fact_accuracy": 0.3333333333333333,
+        "stale_hit_rate": 0.6666666666666666,
+        "retrieval_coverage": 1.0,
+        "latency_ms_median": 0.226,
+        "latency_ms_p95": 0.276,
+        "example_errors": [
+          {
+            "query": "candidate0000 application_status",
+            "as_of": "2025-01-15",
+            "expected": "pending",
+            "retrieved": "interview completed"
+          },
+          {
+            "query": "candidate0000 application_status",
+            "as_of": "2025-02-15",
+            "expected": "interview invited",
+            "retrieved": "interview completed"
+          },
+          {
+            "query": "candidate0001 application_status",
+            "as_of": "2025-01-15",
+            "expected": "pending",
+            "retrieved": "interview completed"
+          }
+        ]
+      },
+      "latest_state_keyword": {
+        "queries": 150,
+        "correct": 50,
+        "top1_fact_accuracy": 0.3333333333333333,
+        "stale_hit_rate": 0.6666666666666666,
+        "retrieval_coverage": 1.0,
+        "latency_ms_median": 0.078,
+        "latency_ms_p95": 0.088,
+        "example_errors": [
+          {
+            "query": "candidate0000 application_status",
+            "as_of": "2025-01-15",
+            "expected": "pending",
+            "retrieved": "interview completed"
+          },
+          {
+            "query": "candidate0000 application_status",
+            "as_of": "2025-02-15",
+            "expected": "interview invited",
+            "retrieved": "interview completed"
+          },
+          {
+            "query": "candidate0001 application_status",
+            "as_of": "2025-01-15",
+            "expected": "pending",
+            "retrieved": "interview completed"
+          }
+        ]
+      },
+      "valid_time_only": {
+        "queries": 150,
+        "correct": 150,
+        "top1_fact_accuracy": 1.0,
+        "stale_hit_rate": 0.0,
+        "retrieval_coverage": 1.0,
+        "latency_ms_median": 0.921,
+        "latency_ms_p95": 1.245,
+        "example_errors": []
+      },
+      "temporal_hybrid": {
+        "queries": 150,
+        "correct": 150,
+        "top1_fact_accuracy": 1.0,
+        "stale_hit_rate": 0.0,
+        "retrieval_coverage": 1.0,
+        "latency_ms_median": 0.905,
+        "latency_ms_p95": 1.111,
+        "example_errors": []
+      }
+    },
+    "late_corrections": {
+      "all_records_keyword": {
+        "queries": 100,
+        "correct": 50,
+        "top1_fact_accuracy": 0.5,
+        "stale_hit_rate": 0.5,
+        "retrieval_coverage": 1.0,
+        "latency_ms_median": 0.142,
+        "latency_ms_p95": 0.156,
+        "example_errors": [
+          {
+            "query": "applicant0000 application_status",
+            "as_of": "2025-01-15",
+            "expected": "pending",
+            "retrieved": "withdrawn"
+          },
+          {
+            "query": "applicant0001 application_status",
+            "as_of": "2025-01-15",
+            "expected": "pending",
+            "retrieved": "withdrawn"
+          },
+          {
+            "query": "applicant0002 application_status",
+            "as_of": "2025-01-15",
+            "expected": "pending",
+            "retrieved": "withdrawn"
+          }
+        ]
+      },
+      "latest_state_keyword": {
+        "queries": 100,
+        "correct": 50,
+        "top1_fact_accuracy": 0.5,
+        "stale_hit_rate": 0.5,
+        "retrieval_coverage": 1.0,
+        "latency_ms_median": 0.072,
+        "latency_ms_p95": 0.085,
+        "example_errors": [
+          {
+            "query": "applicant0000 application_status",
+            "as_of": "2025-01-15",
+            "expected": "pending",
+            "retrieved": "withdrawn"
+          },
+          {
+            "query": "applicant0001 application_status",
+            "as_of": "2025-01-15",
+            "expected": "pending",
+            "retrieved": "withdrawn"
+          },
+          {
+            "query": "applicant0002 application_status",
+            "as_of": "2025-01-15",
+            "expected": "pending",
+            "retrieved": "withdrawn"
+          }
+        ]
+      },
+      "valid_time_only": {
+        "queries": 100,
+        "correct": 50,
+        "top1_fact_accuracy": 0.5,
+        "stale_hit_rate": 0.5,
+        "retrieval_coverage": 1.0,
+        "latency_ms_median": 0.701,
+        "latency_ms_p95": 1.015,
+        "example_errors": [
+          {
+            "query": "applicant0000 application_status",
+            "as_of": "2025-01-15",
+            "expected": "pending",
+            "retrieved": "withdrawn"
+          },
+          {
+            "query": "applicant0001 application_status",
+            "as_of": "2025-01-15",
+            "expected": "pending",
+            "retrieved": "withdrawn"
+          },
+          {
+            "query": "applicant0002 application_status",
+            "as_of": "2025-01-15",
+            "expected": "pending",
+            "retrieved": "withdrawn"
+          }
+        ]
+      },
+      "temporal_hybrid": {
+        "queries": 100,
+        "correct": 100,
+        "top1_fact_accuracy": 1.0,
+        "stale_hit_rate": 0.0,
+        "retrieval_coverage": 1.0,
+        "latency_ms_median": 0.679,
+        "latency_ms_p95": 0.943,
+        "example_errors": []
+      }
+    }
+  }
+}
