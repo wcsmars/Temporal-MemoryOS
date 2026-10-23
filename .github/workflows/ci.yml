@@ -14,8 +14,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e '.[api,mcp,dev]'
-      - run: python -m pytest -q
+      - run: python -m pytest -q --cov --cov-report=term
       - run: ruff check .
+      - run: mypy
       - run: python benchmarks/run.py --entities 10 --output benchmark-results.json
       - run: python benchmarks/scale.py --sizes 30 90 --writes 2 --searches 2 --settle 0 --output benchmark-results-scale.json
       - run: python -m build

@@ -7,14 +7,14 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import tempfile
-from typing import Optional
+from typing import Any, Dict, Iterator, List, Optional
 from uuid import uuid4
 
 from .models import Fact, normalize_time
@@ -23,6 +23,25 @@ from .store import MemoryStore
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _after(previous: str) -> str:
+    """The current time, but strictly later than ``previous``.
+
+    Proposals are listed by creation time, so a batch extracted within one
+    clock tick must still list in the order its lines appeared.
+    """
+    now = _now()
+    if previous and now <= previous:
+        return (datetime.fromisoformat(previous) + timedelta(microseconds=1)).isoformat(
+            timespec="microseconds")
+    return now
+
+
+def _required(value: Optional[str], name: str) -> str:
+    if not value:
+        raise ValueError("Proposal file is missing {}; reject it and extract again".format(name))
+    return value
 
 
 @dataclass
@@ -60,7 +79,7 @@ class ProposalQueue:
         self.directory.mkdir(parents=True, exist_ok=True)
 
     @contextmanager
-    def _lock(self):
+    def _lock(self) -> Iterator[None]:
         # Same POSIX lock discipline as the store; approvals serialize across API workers.
         import fcntl
         lock_path = self.directory / ".lock"
@@ -101,14 +120,15 @@ class ProposalQueue:
             raise KeyError(f"Proposal not found: {proposal_id}")
         return Proposal(**json.loads(path.read_text(encoding="utf-8")))
 
-    def list(self, status: Optional[str] = "pending") -> list[Proposal]:
+    # ``list`` is a method name here, so annotations in this class use ``List``.
+    def list(self, status: Optional[str] = "pending") -> List[Proposal]:
         if status not in (None, "all", "pending", "approved", "rejected"):
             raise ValueError("status must be pending, approved, rejected, or all")
         proposals = [self.get(p.stem) for p in sorted(self.directory.glob("*.json"))]
         return sorted([p for p in proposals if status in (None, "all") or p.status == status],
                       key=lambda p: (p.created_at, p.id))
 
-    def _classify(self, entity: str, attribute: str, value: str, valid_from: str) -> dict:
+    def _classify(self, entity: str, attribute: str, value: str, valid_from: str) -> Dict[str, Any]:
         facts = [f for f in self.store.snapshot(as_of=valid_from, entity=entity)
                  if f.attribute == attribute]
         if not facts:
@@ -132,7 +152,7 @@ class ProposalQueue:
                 "warnings": ["Changes an existing value; review the evidence and effective date."]}
 
     def extract(self, text: str, source: str, observed_at: Optional[str] = None,
-                topic: str = "general") -> list[Proposal]:
+                topic: str = "general") -> List[Proposal]:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Conversation text must not be empty")
         if len(text) > 1_000_000:
@@ -180,6 +200,7 @@ class ProposalQueue:
             self.store.refresh()
             existing = self.list(status="all")
             results = []
+            created = ""
             for entity, attribute, value, effective, raw, confidence in candidates:
                 signature = (entity, attribute, value, effective, source, raw)
                 duplicate = next((p for p in existing if
@@ -190,7 +211,8 @@ class ProposalQueue:
                     continue
                 proposal = Proposal(id=uuid4().hex, entity=entity, attribute=attribute, value=value,
                                     valid_from=effective, source=source, evidence=raw, topic=topic,
-                                    created_at=_now(), confidence=confidence,
+                                    created_at=(created := _after(created)),
+                                    confidence=confidence,
                                     **self._classify(entity, attribute, value, effective))
                 self._save(proposal)
                 existing.append(proposal)
@@ -201,7 +223,7 @@ class ProposalQueue:
         with self._lock():
             proposal = self.get(proposal_id)
             if proposal.status == "approved":
-                return self.store.get(proposal.result_fact_id)
+                return self.store.get(_required(proposal.result_fact_id, "result_fact_id"))
             if proposal.status != "pending":
                 raise ValueError("Only pending proposals can be approved")
             self.store.refresh()
@@ -216,10 +238,11 @@ class ProposalQueue:
             ) != (proposal.kind, proposal.target_id, proposal.target_fingerprint):
                 raise ValueError("Memory changed since this proposal; reject it and extract again")
             if proposal.kind == "duplicate":
-                result = self.store.get(proposal.target_id)
+                result = self.store.get(_required(proposal.target_id, "target_id"))
             elif proposal.kind == "correct":
-                result = self.store.correct(proposal.target_id, proposal.value,
-                                            source=proposal.source, evidence=proposal.evidence)
+                result = self.store.correct(_required(proposal.target_id, "target_id"),
+                                            proposal.value, source=proposal.source,
+                                            evidence=proposal.evidence)
             else:
                 result = self.store.add(entity=proposal.entity, attribute=proposal.attribute,
                                         value=proposal.value, valid_from=proposal.valid_from,

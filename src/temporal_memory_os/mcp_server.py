@@ -7,10 +7,13 @@ The server only speaks MCP on stdout. SDK diagnostics go to stderr.
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Union
+
+if TYPE_CHECKING:
+    from mcp.server.fastmcp import FastMCP
 
 
-def create_server(root=None):
+def create_server(root: Union[str, Path, None] = None) -> "FastMCP":
     """Build a stdio server; optional SDK imports do not affect the core package."""
     try:
         from mcp.server.fastmcp import FastMCP
@@ -97,7 +100,7 @@ def create_server(root=None):
     return server
 
 
-def run(root=None):
+def run(root: Union[str, Path, None] = None) -> None:
     """Run the SDK-managed stdio transport."""
     create_server(root).run(transport="stdio")
 

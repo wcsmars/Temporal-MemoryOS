@@ -44,7 +44,7 @@ PYTHONPATH=src python3 -m temporal_memory_os --root ./memory-data demo
 | Git history | Opt-in local commits of memory and proposal files, with unrelated staging preserved |
 | Interfaces | Python API, JSON CLI, optional HTTP API and read-only MCP stdio tools |
 | Incremental index | File-signature change detection; writes validate only the history they touch |
-| Validation | Behavioral tests, GitHub Actions, reproducible synthetic diagnostics and scale benchmark |
+| Validation | Behavioral and property-based tests, strict typing, coverage and mutation testing, reproducible benchmarks |
 
 The default embedding provider is **lexical hashing**, not a learned semantic model. Learned semantic embeddings require the optional provider below. Extraction is a deliberately narrow rule-based parser; it does not claim to understand arbitrary conversation.
 
@@ -230,7 +230,7 @@ memoryos --root /absolute/path/to/private-memory checkpoint --message "Review in
 memoryos --root /absolute/path/to/private-memory git-log
 ```
 
-No remote is created and nothing is pushed. Checkpoints only commit memory and proposal changes, excluding locks and derived indexes. Git retains prior contents: retraction is not secure erasure. Use synthetic data in public repositories and keep your personal store private.
+Checkpoints refuse to run until an identity is configured in that repository or supplied through Git's author and committer environment variables; Git is never allowed to guess one from the account name and hostname. No remote is created and nothing is pushed. Checkpoints only commit memory and proposal changes, excluding locks and derived indexes. Git retains prior contents: retraction is not secure erasure. Use synthetic data in public repositories and keep your personal store private.
 
 ## Project layout
 
@@ -241,21 +241,41 @@ No remote is created and nothing is pushed. Checkpoints only commit memory and p
 | `src/temporal_memory_os/extraction.py` | Rule-based extraction and the approval queue with stale-preview checks |
 | `src/temporal_memory_os/models.py` | Fact validation, UTC normalization, safe topic paths |
 | `src/temporal_memory_os/{cli,api,mcp_server,git_history}.py` | JSON CLI, optional HTTP API, read-only MCP tools, opt-in Git checkpoints |
-| `tests/` | Behavioral tests, including independent-process write conflicts and outside-edit detection |
+| `tests/` | Behavioral and property-based tests, including a reference model of the time rules |
 | `benchmarks/` | Accuracy and scale benchmarks, their JSON reports and the charts above |
+| `tools/mutation_summary.py` | Summarizes a mutation-testing run and lists survivors worth review |
 | `docs/` | [Architecture and temporal semantics](docs/architecture.md), [validation record](docs/validation.md) |
 
-## Tests and benchmarks
+## Verification
+
+Each layer catches a different kind of mistake. CI runs every layer except mutation testing on each push, for Python 3.10 to 3.13.
+
+| Layer | What it checks |
+| --- | --- |
+| Behavioral tests | Temporal semantics, corrections, retractions, outside edits, crash cleanup, CLI, HTTP API, MCP tools, Git checkpoints, and writers in separate processes |
+| Property-based tests | Random histories of adds, corrections, retractions and searches are checked after every step against an independent reference model of the time rules, including which writes must be rejected and why. Also: time normalization ordering, Markdown round-trips of arbitrary text, and extraction of arbitrary structured lines |
+| Coverage | Branch coverage, including the CLI's child processes; CI fails below 90% (currently 94%) |
+| Types | `mypy` with every function annotated and all bodies checked |
+| Mutation testing | Breaks the core modules one small change at a time (2,163 mutants) and checks that some test fails |
+| Benchmarks | Exact-version retrieval against baselines, and latency as the store grows |
 
 ```sh
 python -m pip install -e '.[api,mcp,dev]'
-pytest -q
+pytest -q --cov          # 157 tests, coverage report and 90% floor
 ruff check .
+mypy
 python benchmarks/run.py --entities 50 --output benchmark-results.json
 python benchmarks/scale.py --sizes 300 1000 --output benchmark-results-scale.json
+
+# Mutation testing (a few minutes; macOS or Linux)
+python -m pip install -e '.[mutation]'
+HYPOTHESIS_PROFILE=mutation mutmut run
+python tools/mutation_summary.py
 ```
 
-See [the local validation record](docs/validation.md). The diagnostics measure exact-version retrieval and latency. They are not an evaluation of generated answer accuracy or hallucinations.
+The current mutation run catches 1,739 of 2,163 mutants (80%). Of the 424 survivors, 272 only change the wording or letter case of a string, such as an error message or an SQL keyword. Excluding those, 92% are caught. The remaining survivors were reviewed: they alter things with no observable effect in supported setups, such as temporary-file names, JSON spacing inside the derived index, cache sizes, or clamping values already in range.
+
+Adding these layers found and fixed two bugs (Git checkpoints could record an identity guessed from the computer's account name and hostname; proposals extracted within one clock tick could list out of order), removed a full-text table that was written on every save but never read, and pinned behavior that no test had covered, such as exact rank-fusion scores and both directions of link expansion. See [the validation record](docs/validation.md) and the [changelog](CHANGELOG.md). The benchmarks measure exact-version retrieval and latency, not generated answer accuracy.
 
 ## Design and scope
 

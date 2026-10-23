@@ -16,7 +16,7 @@ flowchart TD
   R --> F["Rank fusion and citations"]
 ```
 
-The Markdown files are authoritative. SQLite provides a disposable FTS5 index, a validated record cache, and a signature of the files it was built from. API and MCP requests create a store per request; direct Python instances can be reused.
+The Markdown files are authoritative. SQLite provides a disposable, validated record index and a signature of the files it was built from. It holds no full-text index: keyword search builds one per query over the time-filtered snapshot (see Retrieval). API and MCP requests create a store per request; direct Python instances can be reused.
 
 ### Keeping the index honest without rereading everything
 

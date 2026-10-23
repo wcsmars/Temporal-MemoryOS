@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1
+
+- Fix: `checkpoint` no longer lets Git invent an author from the computer's account name and hostname when no identity is configured. It now requires `user.name`/`user.email` in the memory repository or the standard Git environment variables, as documented.
+- Approving a proposal file that lacks its target ID now fails with a clear message instead of an unrelated lookup error.
+- Fix: proposals extracted within one clock tick could list out of line order (ties broke on random IDs). Creation times are now strictly increasing within a batch.
+- The index no longer maintains a persistent full-text table that no query read; keyword search has always built its own over the time-filtered snapshot. Existing indexes drop it on open.
+- Removed the unused `embeddings.cosine_similarity` helper and `MemoryStore.conn` alias.
+- Verification: property-based tests against an independent reference model, strict `mypy`, branch coverage with a 90% floor in CI, and a configured mutation-testing run (see the README).
+
 ## 0.2.0
 
 - Writes no longer reread and revalidate every Markdown record. The index keeps a signature of the files it was built from (size, modification time, SHA-256); a cheap scan detects outside edits, deletions and new files, and only then triggers a full rebuild. A write validates just the entity/attribute history it touches.

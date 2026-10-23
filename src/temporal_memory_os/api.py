@@ -8,15 +8,18 @@ making it accessible to other processes or hosts.
 import os
 import secrets
 from pathlib import Path
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterator, Literal, Optional, Union
 
 from . import __version__
 
+if TYPE_CHECKING:
+    from fastapi import FastAPI
 
-def create_app(root=None):
+
+def create_app(root: Union[str, Path, None] = None) -> "FastAPI":
     """Create an application without importing optional dependencies at startup."""
     try:
-        from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query
+        from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
         from fastapi.responses import JSONResponse
         from pydantic import BaseModel, ConfigDict, Field
     except ImportError as exc:
@@ -39,7 +42,7 @@ def create_app(root=None):
         ),
     )
 
-    def authenticate(authorization: Optional[str] = Header(default=None)):
+    def authenticate(authorization: Optional[str] = Header(default=None)) -> None:
         if not token:
             return
         scheme, _, supplied = (authorization or "").partition(" ")
@@ -54,24 +57,24 @@ def create_app(root=None):
 
     router = APIRouter(prefix="/api", dependencies=[Depends(authenticate)])
 
-    def get_store():
+    def get_store() -> Iterator[MemoryStore]:
         with MemoryStore(memory_root) as store:
             yield store
 
     @app.exception_handler(ValueError)
-    async def invalid_value(_request, exc):
+    async def invalid_value(_request: Request, exc: Exception) -> JSONResponse:
         return JSONResponse(status_code=422, content={"detail": str(exc)})
 
     @app.exception_handler(MemoryConflictError)
-    async def conflicting_revision(_request, exc):
+    async def conflicting_revision(_request: Request, exc: Exception) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     @app.exception_handler(KeyError)
-    async def missing_key(_request, _exc):
+    async def missing_key(_request: Request, _exc: Exception) -> JSONResponse:
         return JSONResponse(status_code=404, content={"detail": "Memory record not found"})
 
     @app.exception_handler(FileNotFoundError)
-    async def missing_file(_request, _exc):
+    async def missing_file(_request: Request, _exc: Exception) -> JSONResponse:
         return JSONResponse(status_code=404, content={"detail": "Memory record not found"})
 
     class AddFact(BaseModel):
@@ -102,7 +105,7 @@ def create_app(root=None):
         topic: str = Field(default="general", max_length=500)
 
     @app.get("/health", tags=["service"])
-    def health():
+    def health() -> Dict[str, str]:
         return {"status": "ok", "service": "temporal-memory-os"}
 
     @router.get("/facts", tags=["memory"])
@@ -110,26 +113,26 @@ def create_app(root=None):
         as_of: Optional[str] = None,
         known_at: Optional[str] = None,
         entity: Optional[str] = None,
-        store=Depends(get_store),
-    ):
+        store: MemoryStore = Depends(get_store),
+    ) -> Dict[str, Any]:
         records = store.snapshot(as_of=as_of, known_at=known_at, entity=entity)
         return {"facts": [fact.to_dict() for fact in records]}
 
     @router.get("/facts/{fact_id}", tags=["memory"])
-    def fetch_fact(fact_id: str, store=Depends(get_store)):
+    def fetch_fact(fact_id: str, store: MemoryStore = Depends(get_store)) -> Dict[str, Any]:
         """Fetch an audit record by ID; it may have been superseded or retracted."""
         return store.get(fact_id).to_dict()
 
     @router.post("/facts", status_code=201, tags=["memory"])
-    def add_fact(payload: AddFact, store=Depends(get_store)):
+    def add_fact(payload: AddFact, store: MemoryStore = Depends(get_store)) -> Dict[str, Any]:
         return store.add(**payload.model_dump()).to_dict()
 
     @router.post("/facts/{fact_id}/corrections", status_code=201, tags=["memory"])
-    def correct_fact(fact_id: str, payload: CorrectFact, store=Depends(get_store)):
+    def correct_fact(fact_id: str, payload: CorrectFact, store: MemoryStore = Depends(get_store)) -> Dict[str, Any]:
         return store.correct(fact_id, **payload.model_dump()).to_dict()
 
     @router.delete("/facts/{fact_id}", tags=["memory"])
-    def retract_fact(fact_id: str, store=Depends(get_store)):
+    def retract_fact(fact_id: str, store: MemoryStore = Depends(get_store)) -> Dict[str, Any]:
         """Retract a fact while retaining audit history; this is not secure erasure."""
         return store.retract(fact_id, source="http-api").to_dict()
 
@@ -138,8 +141,8 @@ def create_app(root=None):
         entity: str = Query(min_length=1),
         attribute: Optional[str] = None,
         known_at: Optional[str] = None,
-        store=Depends(get_store),
-    ):
+        store: MemoryStore = Depends(get_store),
+    ) -> Dict[str, Any]:
         records = store.history(entity, attribute=attribute, known_at=known_at)
         return {"facts": [fact.to_dict() for fact in records]}
 
@@ -151,19 +154,19 @@ def create_app(root=None):
         limit: int = Query(default=5, ge=1, le=100),
         mode: Literal["keyword", "semantic", "graph", "hybrid"] = "hybrid",
         entity: Optional[str] = None,
-        store=Depends(get_store),
-    ):
+        store: MemoryStore = Depends(get_store),
+    ) -> Dict[str, Any]:
         results = HybridRetriever(store).search(
             q, as_of=as_of, known_at=known_at, limit=limit, mode=mode, entity=entity
         )
         return {"results": [result.to_dict() for result in results]}
 
     @router.post("/reindex", tags=["maintenance"])
-    def reindex(store=Depends(get_store)):
+    def reindex(store: MemoryStore = Depends(get_store)) -> Dict[str, Any]:
         return {"indexed": store.reindex()}
 
     @router.post("/proposals/extract", status_code=201, tags=["proposals"])
-    def extract(payload: ExtractRequest, store=Depends(get_store)):
+    def extract(payload: ExtractRequest, store: MemoryStore = Depends(get_store)) -> Dict[str, Any]:
         from .extraction import ProposalQueue
 
         proposed = ProposalQueue(store).extract(**payload.model_dump())
@@ -172,20 +175,20 @@ def create_app(root=None):
     @router.get("/proposals", tags=["proposals"])
     def list_proposals(
         status: Literal["pending", "approved", "rejected"] = "pending",
-        store=Depends(get_store),
-    ):
+        store: MemoryStore = Depends(get_store),
+    ) -> Dict[str, Any]:
         from .extraction import ProposalQueue
 
         return {"proposals": [p.to_dict() for p in ProposalQueue(store).list(status=status)]}
 
     @router.post("/proposals/{proposal_id}/approve", tags=["proposals"])
-    def approve(proposal_id: str, store=Depends(get_store)):
+    def approve(proposal_id: str, store: MemoryStore = Depends(get_store)) -> Dict[str, Any]:
         from .extraction import ProposalQueue
 
         return ProposalQueue(store).approve(proposal_id).to_dict()
 
     @router.post("/proposals/{proposal_id}/reject", tags=["proposals"])
-    def reject(proposal_id: str, store=Depends(get_store)):
+    def reject(proposal_id: str, store: MemoryStore = Depends(get_store)) -> Dict[str, Any]:
         from .extraction import ProposalQueue
 
         return ProposalQueue(store).reject(proposal_id).to_dict()

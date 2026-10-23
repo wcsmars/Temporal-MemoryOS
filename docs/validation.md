@@ -1,13 +1,16 @@
 # Local validation record
 
-Validated on 23 October 2026 for version 0.2.0, using Python 3.11.7 on macOS (arm64).
+Validated on 23 October 2026 for version 0.2.1, using Python 3.11.7 on macOS (arm64).
 
-- 64 tests passed with no skips, across temporal storage, retrieval, extraction, change detection, CLI, HTTP API, MCP tools, Git history, and independent-process write conflicts.
-- `ruff check .` passes with the configured rules.
+- 157 tests passed with no skips: behavioral tests across temporal storage, retrieval, extraction, change detection, CLI, HTTP API, MCP tools, Git history and independent-process writes, plus property-based tests.
+- The property-based state machine ran 200 random histories of up to 40 steps each against an independent reference model, with no disagreement in snapshots, histories, search eligibility, rejected writes or rebuilt indexes.
+- Branch coverage is 94% (1,221 statements, 402 branches), including CLI child processes. CI fails below 90%.
+- `mypy` passes with every function annotated and all bodies checked; `ruff check .` passes.
+- Mutation testing (mutmut 3.8 over `store`, `models`, `retrieval`, `extraction` and `embeddings`): 1,739 of 2,163 mutants caught (80.4%). 272 of the 424 survivors only change string wording or case; excluding them, 92.0% are caught. The other survivors were reviewed by category and change nothing observable in supported setups. The first run caught 71.1%; the gaps it exposed are now tested.
 - The wheel and source distribution build without warnings. The wheel installs into an empty virtual environment with no dependencies, and the installed CLI reproduces the synthetic application timeline.
 - An index written by version 0.1 is detected by its schema version and rebuilt from Markdown on first open; dated search results are unchanged.
 - Python 3.10, 3.12 and 3.13 are covered by the GitHub Actions matrix, not by local runs.
-- Learned model weights were not downloaded. Semantic integration is tested through an injected provider and lazy configuration, not through a downloaded Sentence Transformers model.
+- Learned model weights were not downloaded. Semantic integration is tested through injected providers and a stand-in for the Sentence Transformers package.
 
 ## Exact-version retrieval
 
@@ -24,7 +27,7 @@ Every miss is a stale or future version of the right entity and attribute; cover
 
 ## Scale
 
-[Version 0.2 report](../benchmarks/results/scale-current.json) and [version 0.1 report](../benchmarks/results/scale-v0.1.json), produced by `benchmarks/scale.py` on the same machine on the same day. Medians:
+Measured on version 0.2.0; 0.2.1 only removes work from the write path. [Version 0.2 report](../benchmarks/results/scale-current.json) and [version 0.1 report](../benchmarks/results/scale-v0.1.json), produced by `benchmarks/scale.py` on the same machine on the same day. Medians:
 
 | Records | Operation | 0.1 | 0.2 |
 | ---: | --- | ---: | ---: |

@@ -4,4 +4,4 @@ from .models import Fact
 from .store import MemoryStore
 
 __all__ = ["Fact", "MemoryStore"]
-__version__ = "0.2.0"
+__version__ = "0.2.1"

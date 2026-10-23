@@ -6,10 +6,20 @@ import math
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
-from .embeddings import create_embedder, normalized_tokens, tokenize
-from .models import Fact
+from .embeddings import Embedder, create_embedder, normalized_tokens, tokenize
+from .models import Fact, TimeInput
+
+Ranking = List[Tuple[str, float]]
+
+
+class FactSource(Protocol):
+    """What retrieval needs from a store: a resolved temporal snapshot."""
+
+    def snapshot(self, as_of: TimeInput = None, known_at: TimeInput = None,
+                 entity: Optional[str] = None) -> List[Fact]:
+        ...
 
 
 @dataclass
@@ -19,7 +29,7 @@ class SearchResult:
     channels: Dict[str, float]
     citation: str
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "fact": self.fact.to_dict(),
             "score": self.score,
@@ -28,7 +38,7 @@ class SearchResult:
         }
 
 
-def _validated(vector) -> Tuple[List[float], float]:
+def _validated(vector: Sequence[float]) -> Tuple[List[float], float]:
     values = [float(value) for value in vector]
     if not all(math.isfinite(value) for value in values):
         raise ValueError("Embedding vectors must contain only finite numbers")
@@ -49,22 +59,23 @@ class HybridRetriever:
     available_modes = ("keyword", "semantic", "graph", "hybrid")
     cache_limit = 100_000
 
-    def __init__(self, store, embedder=None, semantic_threshold: float = 0.25):
+    def __init__(self, store: FactSource, embedder: Optional[Embedder] = None,
+                 semantic_threshold: float = 0.25):
         if not math.isfinite(semantic_threshold) or not -1.0 <= semantic_threshold <= 1.0:
             raise ValueError("semantic_threshold must be a finite number between -1 and 1")
         self.store = store
-        self.embedder = embedder if embedder is not None else create_embedder()
+        self.embedder: Embedder = embedder if embedder is not None else create_embedder()
         self.semantic_threshold = semantic_threshold
         # Records are immutable and a snapshot only shortens valid_to, which
         # is not embedded, so a fact ID identifies its document vector.
-        self._vectors: Dict[str, Tuple[int, tuple, float, frozenset]] = {}
+        self._vectors: Dict[str, Tuple[int, Tuple[Tuple[int, float], ...], float, frozenset]] = {}
 
     @property
     def embedding_channel(self) -> str:
         return "semantic" if getattr(self.embedder, "semantic", True) else "lexical_embedding"
 
     def search(
-        self, query: str, as_of=None, known_at=None, limit: int = 5,
+        self, query: str, as_of: TimeInput = None, known_at: TimeInput = None, limit: int = 5,
         mode: str = "hybrid", entity: Optional[str] = None,
     ) -> List[SearchResult]:
         if not isinstance(query, str):
@@ -82,7 +93,7 @@ class HybridRetriever:
         if not facts or not tokenize(query):
             return []
 
-        channels = {}
+        channels: Dict[str, Ranking] = {}
         if mode in ("keyword", "hybrid"):
             channels["keyword"] = self._keyword(query, facts)
         if mode in ("semantic", "hybrid"):
@@ -90,8 +101,8 @@ class HybridRetriever:
         if mode in ("graph", "hybrid"):
             channels["graph"] = self._graph(query, facts)
 
-        raw_scores = {}
-        fused = {}
+        raw_scores: Dict[str, Dict[str, float]] = {}
+        fused: Dict[str, float] = {}
         for channel, ranking in channels.items():
             for rank, (fact_id, raw) in enumerate(ranking, start=1):
                 raw_scores.setdefault(fact_id, {})[channel] = round(raw, 8)
@@ -112,7 +123,7 @@ class HybridRetriever:
         ])
 
     @staticmethod
-    def _keyword(query: str, facts: List[Fact]):
+    def _keyword(query: str, facts: List[Fact]) -> Ranking:
         terms = list(dict.fromkeys(tokenize(query)))[:64]
         if not terms:
             return []
@@ -139,7 +150,7 @@ class HybridRetriever:
         finally:
             connection.close()
 
-    def _embedding(self, query: str, facts: List[Fact]):
+    def _embedding(self, query: str, facts: List[Fact]) -> Ranking:
         texts = [self._text(fact) for fact in facts]
         missing = [index for index, fact in enumerate(facts) if fact.id not in self._vectors]
         if len(self._vectors) + len(missing) > self.cache_limit:
@@ -161,7 +172,7 @@ class HybridRetriever:
         lexical = not getattr(self.embedder, "semantic", True)
         threshold = 0.0 if lexical else self.semantic_threshold
         query_tokens = set(normalized_tokens(query))
-        ranking = []
+        ranking: Ranking = []
         for fact in facts:
             dimensions, pairs, norm, tokens = self._vectors[fact.id]
             # Hash collisions must never produce apparently relevant results.
@@ -178,7 +189,7 @@ class HybridRetriever:
         return sorted(ranking, key=lambda item: (-item[1], item[0]))
 
     @staticmethod
-    def _graph(query: str, facts: List[Fact]):
+    def _graph(query: str, facts: List[Fact]) -> Ranking:
         query_tokens = set(tokenize(query))
         entities = {fact.entity.casefold(): set(tokenize(fact.entity)) for fact in facts}
         seeds = {entity for entity, tokens in entities.items() if tokens and tokens <= query_tokens}
@@ -192,7 +203,7 @@ class HybridRetriever:
                 adjacent.update(linked)
             if linked & seeds:
                 adjacent.add(entity)
-        ranking = []
+        ranking: Ranking = []
         for fact in facts:
             entity = fact.entity.casefold()
             if entity in seeds:

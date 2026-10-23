@@ -80,7 +80,6 @@ class MemoryStore:
         self.connection = sqlite3.connect(str(self.db_path), timeout=30, isolation_level=None,
                                           check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
-        self.conn = self.connection
         self._lock = threading.RLock()
         # Parsed records keyed by ID. The stored payload is compared on every
         # hit, so a rebuild by another process can never serve a stale record.
@@ -112,9 +111,9 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS facts_temporal ON facts(entity, attribute, valid_from, recorded_at);
             CREATE INDEX IF NOT EXISTS facts_recorded ON facts(recorded_at);
             CREATE INDEX IF NOT EXISTS facts_supersedes ON facts(supersedes);
-            CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
-                id UNINDEXED, entity, attribute, value, evidence, source, tags, links
-            );
+            -- Keyword search builds its FTS table per query over the time-filtered
+            -- snapshot, so a persistent one would only cost writes.
+            DROP TABLE IF EXISTS facts_fts;
             CREATE TABLE IF NOT EXISTS sources (
                 path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
                 sha256 TEXT NOT NULL, verified_ns INTEGER NOT NULL
@@ -139,7 +138,7 @@ class MemoryStore:
         title = "{} · {}".format(fact.entity, fact.attribute).replace("\n", " ").replace("\r", " ")
         return (
             "# " + title + "\n\n"
-            "Edit the JSON block below, then run `memoryos reindex`. The JSON block is canonical.\n\n"
+            "The JSON block below is canonical. Edits are picked up the next time the store opens.\n\n"
             + _MARKER + "\n```json\n"
             + json.dumps(fact.to_dict(), ensure_ascii=False, indent=2)
             + "\n```\n"
@@ -192,7 +191,8 @@ class MemoryStore:
                                     [(now, relative) for relative in racy])
         return True
 
-    def _parse(self, path: Path, raw: bytes) -> Optional[Fact]:
+    @staticmethod
+    def _parse(path: Path, raw: bytes) -> Optional[Fact]:
         text = raw.decode("utf-8")
         markers = _MARKER_LINE.findall(text)
         if not markers:
@@ -276,12 +276,8 @@ class MemoryStore:
         values.extend([path.relative_to(self.root).as_posix(), json.dumps(data, ensure_ascii=False)])
         self.connection.execute("INSERT INTO facts ({}, path, payload) VALUES ({})".format(
             ", ".join(_COLUMNS), ", ".join("?" for _ in values)), values)
-        self.connection.execute("INSERT INTO facts_fts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                                (fact.id, fact.entity, fact.attribute, fact.value, fact.evidence,
-                                 fact.source, " ".join(fact.tags), " ".join(fact.links)))
 
     def _replace_index(self, records: List[Tuple[Fact, Path]], sources: List[tuple]) -> None:
-        self.connection.execute("DELETE FROM facts_fts")
         self.connection.execute("DELETE FROM facts")
         self.connection.execute("DELETE FROM sources")
         for fact, path in records:
@@ -394,7 +390,8 @@ class MemoryStore:
         with self._transaction():
             self._refresh_locked()
             fact = Fact(id=uuid.uuid4().hex, entity=entity, attribute=attribute, value=value,
-                        valid_from=normalize_time(valid_from), valid_to=valid_to,
+                        valid_from=normalize_time(valid_from),
+                        valid_to=None if valid_to is None else normalize_time(valid_to),
                         recorded_at=self._recorded_time(recorded_at), source=source,
                         evidence=evidence, confidence=confidence,
                         tags=[] if tags is None else tags,
@@ -413,7 +410,7 @@ class MemoryStore:
                 raise MemoryConflictError("This record has already been superseded; correct the latest revision")
             if deleted and old.deleted:
                 raise MemoryConflictError("This record has already been retracted")
-            fact = replace(old, id=uuid.uuid4().hex, value="" if deleted else value,
+            fact = replace(old, id=uuid.uuid4().hex, value="" if deleted or value is None else value,
                            source=source, evidence=evidence, deleted=deleted,
                            recorded_at=self._recorded_time(recorded_at), supersedes=old.id)
             return self._write(fact)
@@ -439,7 +436,7 @@ class MemoryStore:
             row = self.connection.execute("SELECT path FROM facts WHERE id = ?", (fact_id,)).fetchone()
         if row is None:
             raise KeyError(fact_id)
-        return self.root / row["path"]
+        return self.root / str(row["path"])
 
     def all_facts(self) -> List[Fact]:
         with self._lock:
@@ -513,5 +510,5 @@ class MemoryStore:
     def __enter__(self) -> "MemoryStore":
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
+    def __exit__(self, *_: object) -> None:
         self.close()

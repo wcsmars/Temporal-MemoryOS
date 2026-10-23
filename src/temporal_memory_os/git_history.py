@@ -7,6 +7,9 @@ import subprocess
 from pathlib import Path
 
 
+_EXPLICIT_IDENTITY = ("-c", "user.useConfigOnly=true")
+
+
 class GitHistory:
     """Never stages a parent repository, pushes, or changes global Git settings."""
 
@@ -61,8 +64,10 @@ class GitHistory:
             targets.append(name)
         # Check the effective identity before altering the index. Environment identities
         # are supported; missing identity is never guessed or written to Git config.
-        identity = self._git("var", "GIT_AUTHOR_IDENT", check=False)
-        committer = self._git("var", "GIT_COMMITTER_IDENT", check=False)
+        # useConfigOnly stops Git from inventing an identity from the account
+        # name and hostname, which would otherwise end up in commit history.
+        identity = self._git(*_EXPLICIT_IDENTITY, "var", "GIT_AUTHOR_IDENT", check=False)
+        committer = self._git(*_EXPLICIT_IDENTITY, "var", "GIT_COMMITTER_IDENT", check=False)
         if identity.returncode or committer.returncode:
             raise ValueError(
                 "Configure user.name and user.email in this memory repository before "
@@ -90,7 +95,7 @@ class GitHistory:
         if not changed_paths:
             return {"committed": False, "reason": "No memory changes."}
         # --only keeps any unrelated, already-staged files out of this commit.
-        self._git("commit", "--only", "--quiet", "-m", message, "--",
+        self._git(*_EXPLICIT_IDENTITY, "commit", "--only", "--quiet", "-m", message, "--",
                   *[":(literal)" + name for name in changed_paths])
         commit = self._git("rev-parse", "HEAD").stdout.strip()
         return {"committed": True, "commit": commit, "message": message}

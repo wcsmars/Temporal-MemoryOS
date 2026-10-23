@@ -11,7 +11,7 @@ import hashlib
 import math
 import os
 import re
-from typing import List, Optional, Protocol, Sequence
+from typing import Any, List, Optional, Protocol, Sequence
 
 
 _TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
@@ -87,7 +87,7 @@ class SentenceTransformerEmbedder:
             raise ValueError("model_name must be a non-empty string")
         self.model_name = model_name
         self.name = "sentence-transformers:" + model_name
-        self._model = None
+        self._model: Any = None
 
     def embed(self, texts: Sequence[str]) -> List[List[float]]:
         if not texts:
@@ -120,15 +120,3 @@ def create_embedder(model_name: Optional[str] = None) -> Embedder:
     selected = (model_name or "").strip() or os.environ.get("MEMORYOS_EMBEDDING_MODEL", "").strip()
     return SentenceTransformerEmbedder(selected) if selected else HashingEmbedder()
 
-
-def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
-    if len(left) != len(right):
-        raise ValueError("Embedding provider returned inconsistent vector dimensions")
-    if not all(math.isfinite(float(value)) for value in (*left, *right)):
-        raise ValueError("Embedding vectors must contain only finite numbers")
-    left_norm = math.sqrt(sum(value * value for value in left))
-    right_norm = math.sqrt(sum(value * value for value in right))
-    if not left_norm or not right_norm:
-        return 0.0
-    value = sum(a * b for a, b in zip(left, right)) / (left_norm * right_norm)
-    return max(-1.0, min(1.0, value))

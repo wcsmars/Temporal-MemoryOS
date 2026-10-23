@@ -15,6 +15,14 @@ memory-data/
 *.sqlite3*
 benchmark-results*.json
 
+# Test and analysis tooling output
+.hypothesis/
+.coverage*
+coverage.xml
+htmlcov/
+mutants/
+.mypy_cache/
+
 # Secrets and private data
 .env
 .env.*

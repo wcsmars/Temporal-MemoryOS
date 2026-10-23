@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+from typing import Any, Dict, List
+
 from .store import MemoryStore
 
 
 DEMO_SOURCE = "synthetic:temporal-memoryos-demo-v1"
 
 
-def seed_demo(store: MemoryStore) -> dict:
-    records = [
+def seed_demo(store: MemoryStore) -> Dict[str, Any]:
+    records: List[Dict[str, Any]] = [
         dict(entity="Acme application", attribute="status", value="pending",
              valid_from="2026-09-01", recorded_at="2026-09-01T09:00:00Z",
              topic="career/applications", links=["Acme"], tags=["career", "application"]),

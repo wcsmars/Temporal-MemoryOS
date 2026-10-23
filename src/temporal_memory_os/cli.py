@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -74,7 +75,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _execute(args: argparse.Namespace):
+def _execute(args: argparse.Namespace) -> Any:
     root = Path(args.root).expanduser().resolve()
     if args.command == "serve":
         try:
