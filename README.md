@@ -24,7 +24,7 @@ memoryos --root ./memory-data search "Acme application status" \
 
 The result contains `value: "pending"`, its effective interval, source, evidence, fact ID, retrieval scores, and the Markdown citation. Run the same search with `--as-of 2026-09-20` for `interview invited`, or `--as-of 2026-10-02` for `interview completed`.
 
-`--root` goes **before** the command. Set `MEMORYOS_HOME` to use a different default directory. The demo is safe to run repeatedly; it does not overwrite existing records.
+`--root` goes **before** the command. Set `MEMORYOS_HOME` to use a different default directory. The demo is safe to run repeatedly: it never overwrites or corrects existing records, and reports any slot that already holds something else under `skipped_existing`.
 
 To run directly from a checkout without installing:
 
@@ -58,22 +58,27 @@ All numbers come from synthetic data on one laptop; the [benchmark methodology](
 
 Keyword search over every version, or over the latest state only, returns the newest status and misses two of every three historical questions. The same engine without a knowledge cutoff answers every state-change question but returns the later correction when asked what was believed before it arrived. With both time axes, all 250 queries return the expected version. These outcomes follow from the design; the workloads are regression checks that the design holds, not evidence of general superiority over RAG systems.
 
-**Latency as the store grows.** Version 0.1 reread and revalidated every Markdown record on each write and on every open. Version 0.2 checks a file signature instead and validates only the history a write touches.
+**Latency as the store grows.** Version 0.1 reread and revalidated every Markdown record on each write and on every open. Version 0.2 checks a file signature instead, validates only the history a write touches, and caches parsed records and document vectors.
 
 ![Write latency by store size](benchmarks/results/scale-write.svg)
 
-![Search latency by store size](benchmarks/results/scale-search.svg)
+![Warm search latency by store size](benchmarks/results/scale-search.svg)
 
-| Records | Write, 0.1 | Write, 0.2 | Open, 0.1 | Open, 0.2 | Dated search, 0.1 | Dated search, 0.2 |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,000 | 127 ms | 4.9 ms | 130 ms | 4.3 ms | 48 ms | 4.8 ms |
-| 10,000 | 1,389 ms | 46 ms | 1,374 ms | 46 ms | 501 ms | 61 ms |
+![Cold and warm search latency by store size](benchmarks/results/scale-search-cold.svg)
 
-Medians on an Apple-silicon laptop with Python 3.11; [raw reports](benchmarks/results/). Opening and writing still stat every file, so both stay linear in the number of records, at roughly 4.5 microseconds per file.
+| Records | Write, 0.1 | Write, 0.2.2 | Open, 0.1 | Open, 0.2.2 | Warm search, 0.1 | Warm search, 0.2.2 | Cold search, 0.1 | Cold search, 0.2.2 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 124 ms | 4.5 ms | 122 ms | 3.7 ms | 47 ms | 5.0 ms | 175 ms | 42 ms |
+| 10,000 | 1,286 ms | 45 ms | 1,304 ms | 41 ms | 496 ms | 57 ms | 1,780 ms | 447 ms |
+
+Medians on an Apple-silicon laptop with Python 3.11; [raw reports](benchmarks/results/). A warm search reuses one open store and retriever, as the HTTP and MCP servers and a long-lived Python program do. A cold search opens the store and builds a new retriever, as each CLI command does (Python start-up excluded); it parses the time-filtered records and embeds them again, which is why it stays about eight times slower than a warm one. Opening and writing still check every file's size and timestamp, so both stay linear in the number of records, at roughly 4 microseconds per file. A full rebuild, needed only after outside edits, costs about the same in both versions.
 
 ## Record, correct, and retrieve
 
+These commands use a fresh directory so they do not collide with the demo's synthetic records.
+
 ```sh
+export MEMORYOS_HOME=./my-memory
 memoryos add "Acme application" status pending \
   --from 2026-09-01 --source "conversation:001" \
   --evidence "The application was submitted and is awaiting review." \
@@ -85,19 +90,21 @@ memoryos add "Acme application" status "interview invited" \
 memoryos history "Acme application" --attribute status
 memoryos search "Acme application status" --as-of 2026-09-10
 memoryos correct FACT_ID "interview scheduled" --source "conversation:correction"
-memoryos retract FACT_ID --source "conversation:retraction"
+memoryos retract NEW_ID --source "conversation:retraction"
 ```
 
-Replace `FACT_ID` with an ID returned by a command. `correct` keeps the original effective date and creates a new revision. Use `add` with a later `--from` when the world changes. A retraction removes that assertion from resolved snapshots; it is **not deletion of the audit record**.
+Replace `FACT_ID` with an ID returned by a command, and `NEW_ID` with the ID that `correct` returned: only the latest revision of a record can be corrected or retracted. `correct` keeps the original effective date and creates a new revision. Use `add` with a later `--from` when the world changes. A retraction removes that assertion from resolved snapshots; it is **not deletion of the audit record**.
 
-For knowledge history, pass a separate cutoff:
+For knowledge history, pass a separate cutoff. The demo's records carry the dates they were learned, so this works on the demo directory:
 
 ```sh
-memoryos search "Acme application status" \
-  --as-of 2026-09-10 --known-at 2026-09-12T23:59:59Z
+memoryos --root ./memory-data search "Alex preferred drink" \
+  --as-of 2026-10-10 --known-at 2026-10-01 --limit 1    # tea: the change was not known yet
+memoryos --root ./memory-data search "Alex preferred drink" \
+  --as-of 2026-10-10 --limit 1                          # decaf coffee
 ```
 
-A correction learned in October changes the retrospective answer for September, but cannot appear in a query restricted to knowledge available in September. Newly entered historical facts are learned now unless an importer explicitly supplies `recorded_at` through the Python API. Both query times default to now. A date without a time means midnight UTC; timestamps with offsets are normalized to UTC. Date arguments are explicit: the engine does not infer dates from the question text.
+The demo learned on 5 October that Alex's drink had changed, so a query limited to what was known on 1 October still answers tea. Corrections work the same way: one learned in October changes the retrospective answer for September, but cannot appear in a query restricted to knowledge available in September. Records entered with `add` are learned now, so a `--known-at` earlier than today excludes them; an importer can supply `recorded_at` through the Python API. Both query times default to now. Times are `YYYY-MM-DD`, optionally followed by `THH:MM`, seconds, up to six fractional digits, and `Z` or `+HH:MM`; the same strings are accepted on every supported Python version. A date without a time means midnight UTC; offsets are normalized to UTC. Date arguments are explicit: the engine does not infer dates from the question text.
 
 ## Extract with human review
 
@@ -109,7 +116,9 @@ memoryos approve PROPOSAL_ID
 memoryos reject PROPOSAL_ID
 ```
 
-Extraction writes proposals only. Review the value, effective date, evidence, change kind, and previous value before approving each ID. Direct `add`, `correct`, and `retract` commands are explicit operator actions and do not use the queue. Approvals detect changed correction targets, including manual edits retaining the same fact ID. Approve a dated conversation's proposals in chronological order.
+Extraction writes proposals only. Review the value, effective date, evidence, change kind, and previous value before approving each ID. Direct `add`, `correct`, and `retract` commands are explicit operator actions and do not use the queue. An approval is refused (HTTP 409) if memory changed in a way the reviewer did not see, including manual edits that keep the same fact ID. Approve a dated conversation's proposals in chronological order: a newer predecessor approved from the same source is expected and does not make later proposals stale, and a later line that repeats the value already in effect is approved without writing a new record. Running an extraction again returns the existing pending proposals instead of duplicates, unless a value for the same attribute has taken effect since.
+
+Damaged proposal files are skipped and reported (`proposals` prints a warning for each on standard error; the HTTP list includes them under `problems`), so one bad file does not block the queue; fix or delete the named file.
 
 Supported inputs are one assertion per line:
 
@@ -120,7 +129,7 @@ My preferred language is English.
 I prefer decaf coffee.
 ```
 
-The fourth pipe-separated field is an optional effective date. An optional date prefix also works. Otherwise the observation time is used. Unsupported prose is ignored; zero proposals means no supported statements were found. Rule confidence values describe parser certainty, not calibrated truth probabilities. Each `(entity, attribute)` has one value at a time; use distinct attributes for multiple concurrent preferences.
+The fourth pipe-separated field is an optional effective date. An optional date prefix also works. Otherwise the observation time is used. Unsupported lines are skipped, including prose or tables that contain `|` without forming three or four fields, and lines with an invalid date; zero proposals means no supported statements were found. Text or a source that is not valid Unicode is rejected. A line with both a date prefix and a different fourth-field date is skipped as ambiguous, and so is a dated line that is a `#` comment. The sentence rules are deliberately narrow and can still misread unusual prose, which is why every proposal is reviewed. Rule confidence values describe parser certainty, not calibrated truth probabilities. Each `(entity, attribute)` has one value at a time, so two lines giving the same attribute for the same time are flagged and only one can be approved; use distinct attributes for multiple concurrent preferences.
 
 ## Editable storage
 
@@ -133,15 +142,15 @@ memory-data/
   .memoryos/index.sqlite3
 ```
 
-Every fact includes `entity`, `attribute`, `value`, `valid_from`, optional `valid_to`, `recorded_at`, `source`, `evidence`, `confidence`, `tags`, `links`, and revision metadata. The JSON fence following `<!-- memoryos:fact:v1 -->` is canonical. Unmarked Markdown notes are left alone and are not indexed.
+Every fact includes `entity`, `attribute`, `value`, `valid_from`, optional `valid_to`, `recorded_at`, `source`, `evidence`, `confidence`, `tags`, `links`, and revision metadata. The JSON fence following `<!-- memoryos:fact:v1 -->` is canonical. Unmarked Markdown notes, in any encoding, are left alone and are not indexed. Names starting with a dot (editor lock and swap files, hidden folders such as `.obsidian/`) are ignored; a symbolic-link Markdown file or folder under `memory/` is rejected. A file that held a record and loses its JSON block (emptied by accident, truncated, or with its marker line changed) is reported by name instead of silently disappearing, so a value it had superseded cannot come back. On case-insensitive file systems (the macOS default), use one spelling per topic folder: `Career/` and `career/` are the same folder there.
 
-Edits are picked up automatically. The index stores each Markdown file's size, modification time and hash; opening the store and every write compare them with the folder and rebuild only if something changed outside the engine. To force a full rebuild:
+Edits made with an editor are picked up automatically. The index records each Markdown file's size, modification time and SHA-256. Opening the store and every write compare sizes and modification times with the folder, and also hash any file modified within a few seconds of its last check (a timestamp that close cannot be trusted on every filesystem). The index is rebuilt only if something changed outside the engine. A copy that keeps the old size and timestamp (`cp -p`, `rsync -t`, `touch -r`) can go unnoticed; after such a change, rebuild explicitly:
 
 ```sh
 memoryos reindex
 ```
 
-A complete validation pass precedes index replacement; a malformed record cannot replace a good index with a partial one. Long-lived Python instances call `refresh()` (cheap when nothing changed) to see external edits made while they are open. SQLite is disposable and can be rebuilt from the Markdown. Changing an old file directly rewrites that source history; use `correct` when the previous assertion must remain auditable.
+A complete validation pass precedes index replacement; a malformed record cannot replace a good index with a partial one, and the error names the files involved, relative to the memory directory. Long-lived Python instances call `refresh()` (cheap when nothing changed) to see external edits made while they are open. SQLite is disposable: if the index file is damaged, commands stop with a message, and `memoryos reindex` sets the damaged file aside as `index.sqlite3.corrupt-<time>` and rebuilds it from the Markdown (stop servers using the directory first). An index written by a newer release asks you to delete `.memoryos/`; to go back to an older release, delete `.memoryos/` too, since older releases cannot read the newer index. Changing an old file directly rewrites that source history; use `correct` when the previous assertion must remain auditable.
 
 ## Python API and learned embeddings
 
@@ -162,12 +171,14 @@ To enable a learned embedding model for the CLI, API, and MCP:
 ```sh
 python -m pip install -e '.[semantic]'
 export MEMORYOS_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-memoryos search "What drink does Alex enjoy?" --mode semantic
+memoryos --root ./memory-data search "What drink does Alex enjoy?" --mode semantic
 ```
 
-The first embedding request may download model weights. A local model directory also works. No remote model code is trusted. For Python, supply `SentenceTransformerEmbedder(model_name)` explicitly to `HybridRetriever(store, embedder=...)`.
+The first embedding request may download model weights; a model already in the local cache loads without network access. Code published alongside a model on the Hub is never executed, so a model that needs such code may load with untrained weights and return meaningless scores; check results when trying a new model. A local model directory is loaded like a Python package, so only use directories you trust. `HybridRetriever(store)` in Python also honors `MEMORYOS_EMBEDDING_MODEL`; pass `embedder=SentenceTransformerEmbedder(name)` to choose a model explicitly. The HTTP and MCP servers load the model once per process and share one cache of document vectors. In Python, vectors are cached per retriever: keep one `HybridRetriever` for repeated searches, or pass the same `vector_cache=VectorCache()` to several.
 
-Modes are `keyword`, `semantic`, `graph`, and `hybrid`. Without a learned model, the embedding channel is clearly returned as `lexical_embedding`. Graph retrieval follows links in either direction for one hop. Temporal filtering occurs before every retrieval channel, including the relationships used for expansion. Results are evidence records rather than generated answers, and scores are ranks, not probabilities.
+The semantic threshold (default 0.25) suits MiniLM; models with different similarity scales need their own value, set with `MEMORYOS_SEMANTIC_THRESHOLD`. Semantic mode is for paraphrases; for exact entity names, `hybrid` or `keyword` mode is more reliable.
+
+Modes are `keyword`, `semantic`, `graph`, and `hybrid`. Without a learned model, the embedding channel is clearly returned as `lexical_embedding`. Common question words such as "what" and "does" are ignored in keyword and lexical matching unless they are part of an entity name (so "The Who" is still found), and text is compared after Unicode normalization and case folding; keyword matching also ignores accents. Graph retrieval follows links in either direction for one hop. Temporal filtering occurs before every retrieval channel, including the relationships used for expansion. Rank fusion gives tied scores the same rank. Results are evidence records rather than generated answers, and scores are ranks, not probabilities.
 
 ## HTTP API
 
@@ -178,7 +189,7 @@ export MEMORYOS_API_TOKEN='choose-a-local-token'
 memoryos --root ./memory-data serve
 ```
 
-The default listener is `127.0.0.1:8000`. Interactive documentation: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs). `/health` is public; every `/api` route uses bearer authentication when the token is set. Use the authorization header for requests. This is a single-user local service, not a multi-tenant deployment.
+The default listener is `127.0.0.1:8000`. Interactive documentation: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs). `/health` is public; every `/api` route uses bearer authentication when the token is set (ASCII only). Requests must be addressed to `localhost`, `127.0.0.1` or `::1`, which stops web pages from reaching the API through DNS rebinding, and requests that would change memory are refused when a browser marks them as coming from another site. When serving on another interface, add the host names clients use to `MEMORYOS_ALLOWED_HOSTS` (comma-separated; localhost stays allowed) and set a token: these checks protect against browsers, not against other clients on the network. This is a single-user local service, not a multi-tenant deployment.
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
@@ -192,7 +203,7 @@ The default listener is `127.0.0.1:8000`. Interactive documentation: [http://127
 | POST | `/api/proposals/{id}/approve` or `/reject` | Resolve a proposal |
 | POST | `/api/reindex` | Rebuild the derived index |
 
-The API rejects client-supplied `recorded_at`; imports that need it use the Python interface. Invalid data produces 422, missing records 404, and conflicting memory writes 409.
+The API rejects client-supplied `recorded_at`; imports that need it use the Python interface. Invalid data produces 422, missing records 404, conflicting writes and stale approvals 409, and 503 means the server's files need attention: a damaged record or index (the message names the file relative to the memory directory) or an embedding model that cannot load (details go to the server log only).
 
 ## MCP integration
 
@@ -218,19 +229,28 @@ Tools are `search`, `fetch`, and `memory_history`. They are read-only; changes h
 
 ## Opt-in Git checkpoints
 
-Choose a separate private directory **outside the source repository**:
+Choose a separate private directory **outside any other repository**; `git-init` refuses a directory that is already a repository it did not create:
 
 ```sh
 memoryos --root /absolute/path/to/private-memory init
 memoryos --root /absolute/path/to/private-memory git-init
-# If Git identity is not already configured, configure it locally in that directory.
+# If no Git identity is configured (globally or in this repository), set one here.
 git -C /absolute/path/to/private-memory config user.name "Your Name"
 git -C /absolute/path/to/private-memory config user.email "you@example.com"
 memoryos --root /absolute/path/to/private-memory checkpoint --message "Review initial memory"
 memoryos --root /absolute/path/to/private-memory git-log
 ```
 
-Checkpoints refuse to run until an identity is configured in that repository or supplied through Git's author and committer environment variables; Git is never allowed to guess one from the account name and hostname. No remote is created and nothing is pushed. Checkpoints only commit memory and proposal changes, excluding locks and derived indexes. Git retains prior contents: retraction is not secure erasure. Use synthetic data in public repositories and keep your personal store private.
+Checkpoints use the identity configured in Git (globally or in that repository) or Git's author and committer environment variables, and refuse to run without one; Git is never allowed to guess one from the account name and hostname. Repository-location variables such as `GIT_DIR` are ignored, so a checkpoint always goes to the memory directory's own repository. A checkpoint waits for in-flight writes and approvals, so it never captures an approved proposal without its fact; while it runs, searches continue and writes wait (up to 30 seconds, so a process writing continuously can make a checkpoint fail; retry it). No remote is created and nothing is pushed. Checkpoints only commit memory and proposal changes, excluding locks, temporary files, editor backups (`notes.md~`, `#notes.md#`) and derived indexes. A repository you created yourself is used only after you mark it with `git -C <memory directory> config memoryos.checkpoints true`. Git retains prior contents: retraction is not secure erasure. Use synthetic data in public repositories and keep your personal store private.
+
+To restore a checkpoint, stop anything using the store, bring both folders back to the same commit, then rebuild the index:
+
+```sh
+git -C /absolute/path/to/private-memory restore --source=COMMIT --staged --worktree -- memory proposals
+memoryos --root /absolute/path/to/private-memory reindex
+```
+
+This also removes records committed after `COMMIT`. Files that were never committed stay; `git -C /absolute/path/to/private-memory status --short -- memory proposals` lists them. Do not use `git revert` on a checkpoint whose records were later corrected: removing a record that a later correction refers to leaves a store that cannot be opened until the correction is removed too.
 
 ## Project layout
 
@@ -252,35 +272,40 @@ Each layer catches a different kind of mistake. CI runs every layer except mutat
 
 | Layer | What it checks |
 | --- | --- |
-| Behavioral tests | Temporal semantics, corrections, retractions, outside edits, crash cleanup, CLI, HTTP API, MCP tools, Git checkpoints, and writers in separate processes |
-| Property-based tests | Random histories of adds, corrections, retractions and searches are checked after every step against an independent reference model of the time rules, including which writes must be rejected and why. Also: time normalization ordering, Markdown round-trips of arbitrary text, and extraction of arbitrary structured lines |
-| Coverage | Branch coverage, including the CLI's child processes; CI fails below 90% (currently 94%) |
+| Behavioral tests | Temporal semantics, corrections, retractions, outside edits, damaged files and indexes, interrupted writes and approvals, CLI, HTTP API, MCP tools, Git checkpoints, and writers in separate processes |
+| Regression and contract tests | One or more tests per fixed bug, each confirmed to fail when its fix is reverted, and the JSON shapes, defaults and file names that users and scripts rely on |
+| Property-based tests | Random histories of adds, corrections, retractions and searches, compared after every step with an independent reference model of the time rules, including which writes must be rejected and why. Also: time normalization ordering, Markdown round-trips of arbitrary text, and extraction of arbitrary structured lines |
+| Coverage | Branch coverage, including the CLI's child processes; CI fails below 90% (currently 98.6%) |
 | Types | `mypy` with every function annotated and all bodies checked |
-| Mutation testing | Breaks the core modules one small change at a time (2,163 mutants) and checks that some test fails |
-| Benchmarks | Exact-version retrieval against baselines, and latency as the store grows |
+| Mutation testing | Breaks the core modules one small change at a time (3,522 mutants) and checks that some test fails |
+| Benchmarks | Exact-version retrieval against baselines and latency as the store grows; CI fails if accuracy changes or a chart no longer matches its report |
 
 ```sh
 python -m pip install -e '.[api,mcp,dev]'
-pytest -q --cov          # 157 tests, coverage report and 90% floor
+pytest -q --cov          # 892 tests, coverage report and 90% floor
 ruff check .
 mypy
-python benchmarks/run.py --entities 50 --output benchmark-results.json
+python benchmarks/run.py --entities 50 --check --output benchmark-results.json
 python benchmarks/scale.py --sizes 300 1000 --output benchmark-results-scale.json
+python benchmarks/plot.py --check
 
-# Mutation testing (a few minutes; macOS or Linux)
+# Mutation testing (about 20 minutes on a 12-core laptop; macOS or Linux;
+# run it from a folder that a cloud drive does not sync)
 python -m pip install -e '.[mutation]'
 HYPOTHESIS_PROFILE=mutation mutmut run
 python tools/mutation_summary.py
 ```
 
-The current mutation run catches 1,739 of 2,163 mutants (80%). Of the 424 survivors, 272 only change the wording or letter case of a string, such as an error message or an SQL keyword. Excluding those, 92% are caught. The remaining survivors were reviewed: they alter things with no observable effect in supported setups, such as temporary-file names, JSON spacing inside the derived index, cache sizes, or clamping values already in range.
+In the latest run, on version 0.2.2, tests caught 3,212 of 3,522 mutants (91.2%); 309 survived and one crashed the test process. Of the survivors, 153 only change the wording of an error message or the letter case of an SQL keyword, which the tests deliberately do not pin; without them the score is 95.3%. Every other survivor was reviewed by hand, and a second reviewer tried to refute each verdict. 137 are equivalent: no input can tell them apart from the original, for example a codec name in capitals, which Python matches case-insensitively, or a check on a branch that earlier validation rules out. The other 19 change only an error message's wording, a temporary file's name or a cache's size limit. The review added the tests in `tests/*_pins.py`, which pin behavior no earlier test checked, and, with an adversarial check of its fixes, found 22 edge-case bugs, all fixed in this release (see the changelog).
 
-Adding these layers found and fixed two bugs (Git checkpoints could record an identity guessed from the computer's account name and hostname; proposals extracted within one clock tick could list out of order), removed a full-text table that was written on every save but never read, and pinned behavior that no test had covered, such as exact rank-fusion scores and both directions of link expansion. See [the validation record](docs/validation.md) and the [changelog](CHANGELOG.md). The benchmarks measure exact-version retrieval and latency, not generated answer accuracy.
+See [the validation record](docs/validation.md) and the [changelog](CHANGELOG.md). The benchmarks measure exact-version retrieval and latency, not generated answer accuracy.
 
 ## Design and scope
 
 See [architecture and temporal semantics](docs/architecture.md).
 
-This is a working local foundation, sized for a personal or team memory of thousands to tens of thousands of records. Each search resolves the temporal snapshot and builds a temporary FTS table over it; document vectors are cached per process. Sub-linear opens (filesystem notifications), persistent vector indexes, learned conversational extraction, multi-hop reasoning, multi-user authorization, encrypted storage, hosted transport, and general benchmark comparisons are future work. See the [changelog](CHANGELOG.md). Proposal status and fact writes are separate atomic files; a process crash between them may leave a committed fact with a pending proposal that requires operator reconciliation. Manual file editing must not race with writers.
+This is a working local foundation, sized for a personal or team memory of thousands to tens of thousands of records. Each search resolves the temporal snapshot and builds a temporary FTS table over it. Document vectors are cached by the HTTP and MCP servers for the life of the process and by each Python retriever; each CLI command is a new process and starts cold. Sub-linear opens (filesystem notifications), persistent vector indexes, learned conversational extraction, multi-hop reasoning, multi-user authorization, encrypted storage, hosted transport, and general benchmark comparisons are future work. See the [changelog](CHANGELOG.md).
+
+Proposal status and fact writes are separate atomic files. If a process stops between them, approving the proposal again recognizes the fact that was already written. Writes are flushed with `fsync`, like SQLite's default settings; on macOS that reaches the drive's cache rather than guaranteeing survival of a power cut. Manual file editing must not race with writers.
 
 MIT licensed. No personal data, credentials, or remote service is required for the default demo.

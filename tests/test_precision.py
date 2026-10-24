@@ -113,7 +113,12 @@ def test_hashing_embedder_output_is_pinned():
         HashingEmbedder(dimensions=31)
 
 
-def test_graph_follows_links_in_both_directions_for_one_hop(store):
+def test_graph_follows_links_in_both_directions_for_one_hop(store, monkeypatch):
+    # Fixed IDs, in creation order. Neighbours get smaller IDs than seeds, so
+    # ordering by ID alone fails, and within each score the ID order differs
+    # from both creation order and snapshot order (entity, attribute).
+    ids = iter("{:032x}".format(number) for number in (9, 8, 7, 3, 2, 1, 4))
+    monkeypatch.setattr(store_module.uuid, "uuid4", lambda: types.SimpleNamespace(hex=next(ids)))
     acme = [store.add("Acme", attribute, "x", valid_from="2025-01-01", links=["Delta"])
             for attribute in ("industry", "size", "founded")]
     beacon = [store.add("Beacon project", attribute, "Acme", valid_from="2025-01-01",
@@ -179,7 +184,7 @@ def test_index_rows_without_files_force_a_rebuild(store):
 
 
 def test_schema_version_and_parsed_record_reuse(store):
-    assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 3
     fact = store.add("person", "drink", "tea", valid_from="2025-01-01")
     assert store.get(fact.id) is store.get(fact.id)
 
@@ -245,10 +250,13 @@ def test_comments_and_prose_are_skipped_without_stopping(store, line):
     assert [(p.entity, p.attribute, p.value) for p in proposals] == [("user", "name", "Alex")]
 
 
-@pytest.mark.parametrize("line", ["a | b", "a | b | c | 2025-01-01 | e", "a |  | c"])
-def test_malformed_structured_lines_are_errors(store, line):
-    with pytest.raises(ValueError, match="Structured facts"):
-        ProposalQueue(store).extract(line, source="synthetic:rules")
+@pytest.mark.parametrize("line", ["a | b", "a | b | c | 2025-01-01 | e", "a |  | c",
+                                  "| col | col | col |", "Pros | cons", "a | b | c | someday",
+                                  "2025-13-01: Alex | city | Riverton"])
+def test_malformed_structured_lines_are_skipped_like_prose(store, line):
+    proposals = ProposalQueue(store).extract(line + "\nAlex | city | Riverton",
+                                             source="synthetic:rules", observed_at="2025-01-01")
+    assert [(p.entity, p.value) for p in proposals] == [("Alex", "Riverton")]
 
 
 def test_extraction_size_boundary(store):

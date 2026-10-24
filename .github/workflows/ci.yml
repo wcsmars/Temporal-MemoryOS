@@ -9,14 +9,15 @@ jobs:
       matrix:
         python-version: ['3.10', '3.11', '3.12', '3.13']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e '.[api,mcp,dev]'
       - run: python -m pytest -q --cov --cov-report=term
       - run: ruff check .
       - run: mypy
-      - run: python benchmarks/run.py --entities 10 --output benchmark-results.json
+      - run: python benchmarks/run.py --entities 10 --check --output benchmark-results.json
       - run: python benchmarks/scale.py --sizes 30 90 --writes 2 --searches 2 --settle 0 --output benchmark-results-scale.json
+      - run: python benchmarks/plot.py --check
       - run: python -m build

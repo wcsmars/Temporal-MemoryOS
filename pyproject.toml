@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "temporal-memory-os"
-version = "0.2.1"
+version = "0.2.2"
 description = "Editable, auditable, time-aware memory for AI agents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,12 +27,18 @@ Changelog = "https://github.com/wcsmars/Temporal-MemoryOS/blob/main/CHANGELOG.md
 [project.optional-dependencies]
 api = ["fastapi>=0.115,<1", "pydantic>=2.8,<3", "uvicorn>=0.30,<1"]
 mcp = ["mcp>=1.28,<2"]
-semantic = ["sentence-transformers>=3,<6"]
-dev = [
-  "pytest>=8,<9", "pytest-cov>=6,<8", "coverage[toml]>=7.10,<8", "hypothesis>=6.100,<7",
-  "httpx>=0.27,<1", "ruff>=0.8,<1", "mypy>=1.13,<3", "build>=1,<2",
+# torch 2.6 made weights-only loading the default, so model files cannot run code on load.
+# Intel Macs have no torch builds after 2.2; there the library's own default applies.
+semantic = [
+  "sentence-transformers>=3,<6",
+  "torch>=2.6; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
-mutation = ["mutmut>=3.3,<4"]
+# Floors are versions the checks were run with that also install on Python 3.10.
+dev = [
+  "pytest>=8,<9", "pytest-cov>=7.1,<8", "coverage[toml]>=7.10,<8", "hypothesis>=6.140,<7",
+  "httpx>=0.27,<1", "httpx2>=2.14,<3", "ruff>=0.8,<1", "mypy>=2.4,<3", "build>=1,<2",
+]
+mutation = ["mutmut>=3.8,<4"]
 
 [project.scripts]
 memoryos = "temporal_memory_os.cli:main"
@@ -91,3 +97,5 @@ only_mutate = [
   "src/temporal_memory_os/embeddings.py",
 ]
 pytest_add_cli_args_test_selection = ["tests/"]
+# Tests of the benchmark scripts and tools load them from these folders.
+also_copy = ["benchmarks", "tools"]

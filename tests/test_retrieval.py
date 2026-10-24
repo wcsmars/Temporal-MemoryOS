@@ -1,7 +1,10 @@
 """Retrieval behavior at temporal, provenance and graph boundaries."""
 
+import types
+
 import pytest
 
+import temporal_memory_os.store as store_module
 from temporal_memory_os.embeddings import HashingEmbedder, SentenceTransformerEmbedder, create_embedder
 from temporal_memory_os.retrieval import HybridRetriever
 from temporal_memory_os.store import MemoryStore
@@ -120,3 +123,119 @@ def test_embedder_factory_environment_selection_is_lazy(store, monkeypatch):
     assert HybridRetriever(store, embedder=override).embedder is override
     monkeypatch.setenv("MEMORYOS_EMBEDDING_MODEL", " ")
     assert isinstance(create_embedder(), HashingEmbedder)
+
+
+# Matching rules pinned in 0.2.2
+
+
+@pytest.mark.parametrize("query, entity", [
+    ("Zurich", "José"), ("ZURICH", "José"), ("Jose", "José"), ("jose", "José"),
+    ("Istanbul", "Ayşe"), ("Ayse", "Ayşe"), ("Zürich", "José"),
+])
+def test_keyword_search_ignores_accents(store, query, entity):
+    store.add("José", "city", "Zürich", valid_from="2024-01-01")
+    store.add("Ayşe", "city", "İstanbul", valid_from="2024-01-01")
+    store.add("Bob", "city", "Lima", valid_from="2024-01-01")
+    retriever = HybridRetriever(store, HashingEmbedder())
+    for mode in ("keyword", "hybrid"):
+        assert [hit.fact.entity for hit in retriever.search(query, mode=mode)] == [entity], mode
+
+
+@pytest.mark.parametrize("query, expected", [
+    ("या", None),                       # "or", inside "vidya"
+    ("दी", None),                       # inside "hindi"
+    ("हिन", None),                 # inside "hindi"
+    ("क", None),                             # the first letter of "kaam"
+    ("काम", "Amit"),               # "kaam" itself, not "kom" or "kim"
+    ("कोम", "Neha"),
+    ("ไก่", "Somchai"),            # Thai: differs only in the tone mark
+], ids=["ya", "di", "hin", "ka", "kaam", "kom", "thai-tone"])
+def test_keyword_search_keeps_combining_marks_inside_words(store, query, expected):
+    store.add("person", "subject", "विद्या", valid_from="2024-01-01")
+    store.add("person", "language", "हिन्दी",
+              valid_from="2024-01-01")
+    store.add("Amit", "work", "काम", valid_from="2024-01-01")
+    store.add("Neha", "work", "कोम", valid_from="2024-01-01")
+    store.add("Sunil", "work", "किम", valid_from="2024-01-01")
+    store.add("Somchai", "food", "ไก่", valid_from="2024-01-01")
+    store.add("Malee", "food", "ไก๋", valid_from="2024-01-01")
+    retriever = HybridRetriever(store, HashingEmbedder())
+    for mode in HybridRetriever.available_modes:
+        hits = [hit.fact.entity for hit in retriever.search(query, mode=mode, limit=10)]
+        assert hits == ([] if expected is None or mode == "graph" else [expected]), mode
+
+
+def fixed_ids(monkeypatch, *numbers):
+    """Give the next writes these IDs, in order."""
+    ids = iter("{:032x}".format(number) for number in numbers)
+    monkeypatch.setattr(store_module.uuid, "uuid4", lambda: types.SimpleNamespace(hex=next(ids)))
+
+
+def test_entity_names_made_of_stopwords_still_count(store, monkeypatch):
+    # The stopword-named entities get the largest IDs, so if their names were
+    # dropped from the query, an ID tie-break would rank them last.
+    fixed_ids(monkeypatch, 0xF3, 0xF2, 0xF1, 1, 2, 3, 4)
+    for entity, attribute, value in (
+            ("Will", "employer", "Acme"), ("WHO", "budget", "6.8 billion USD"),
+            ("The Who", "lead singer", "Roger Daltrey"), ("Bob", "employer", "Globex"),
+            ("UNICEF", "budget", "9 billion USD"), ("Queen", "lead singer", "Freddie Mercury"),
+            ("Carol", "employer", "Initech")):
+        store.add(entity, attribute, value, valid_from="2024-01-01")
+    retriever = HybridRetriever(store, HashingEmbedder())
+    for query, entity in (("Will employer", "Will"), ("WHO budget", "WHO"),
+                          ("The Who lead singer", "The Who")):
+        for mode in ("keyword", "semantic", "hybrid"):
+            [top] = retriever.search(query, mode=mode, limit=1)
+            assert top.fact.entity == entity, (query, mode)
+
+
+def test_a_query_of_only_stopwords_matches_nothing(store):
+    store.add("Alex", "drink", "tea", valid_from="2024-01-01",
+              evidence="What is the drink he has for the mornings? Just tea, she said about him.")
+    retriever = HybridRetriever(store, HashingEmbedder())
+    for query in ("what is the", "for the", "Who is it?", "just about him", "he and she",
+                  "hers or his"):
+        for mode in HybridRetriever.available_modes:
+            assert retriever.search(query, mode=mode) == [], (query, mode)
+
+
+def test_question_words_do_not_change_lexical_scores(store):
+    store.add("Alex", "drink", "tea", valid_from="2024-01-01",
+              evidence="what does he do with it")
+    store.add("Alex", "snack", "chips", valid_from="2024-01-01")
+    retriever = HybridRetriever(store, HashingEmbedder())
+
+    def scores(query):
+        return [(hit.fact.value, hit.channels) for hit in retriever.search(
+            query, mode="semantic", limit=10)]
+
+    plain = scores("Alex")
+    assert len(plain) == 2
+    assert scores("what does Alex do") == plain == scores("What is Alex?")
+
+
+def test_entity_filter_and_links_compare_normalized_names(store):
+    composed, decomposed = "José", "José"
+    jose = store.add(composed, "city", "Lima", valid_from="2024-01-01")
+    acme = store.add("Acme", "founder", "someone", valid_from="2024-01-01", links=[decomposed])
+    retriever = HybridRetriever(store, HashingEmbedder())
+    for name in (decomposed, "JOSÉ", "ＪＯＳÉ", " josé "):
+        assert [hit.fact.id for hit in retriever.search("Lima", entity=name)] == [jose.id], name
+    graph = {hit.fact.id: hit.channels["graph"]
+             for hit in retriever.search(composed, mode="graph")}
+    assert graph == {jose.id: 1.0, acme.id: 0.5}
+
+
+def test_graph_seeds_the_name_written_in_the_query(store):
+    c = store.add("C", "paradigm", "procedural", valid_from="2024-01-01")
+    sharp = store.add("C#", "paradigm", "object oriented", valid_from="2024-01-01")
+    plus = store.add("C++", "paradigm", "multi paradigm", valid_from="2024-01-01")
+    cup = store.add("☕", "meaning", "coffee", valid_from="2024-01-01")
+    retriever = HybridRetriever(store, HashingEmbedder())
+    for query, expected in (("C paradigm", c), ("C# paradigm", sharp),
+                            ("tell me about c++", plus), ("Which ☕ is this?", cup)):
+        hits = retriever.search(query, mode="graph", limit=10)
+        assert [(hit.fact.id, hit.channels["graph"]) for hit in hits] == [(expected.id, 1.0)], query
+    # A symbol-only name is never seeded by a query that does not write it.
+    assert cup.id not in {hit.fact.id for hit in retriever.search("coffee meaning",
+                                                                   mode="graph", limit=10)}

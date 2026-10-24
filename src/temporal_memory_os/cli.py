@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,7 @@ from typing import Any
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="memoryos", description="Editable temporal AI memory")
-    parser.add_argument("--root", default=os.environ.get("MEMORYOS_HOME", "./memory-data"),
+    parser.add_argument("--root", default=os.environ.get("MEMORYOS_HOME") or "./memory-data",
                         help="Memory directory (default: MEMORYOS_HOME or ./memory-data)")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("init", help="Create a Markdown store and derived SQLite index")
@@ -80,9 +81,18 @@ def _execute(args: argparse.Namespace) -> Any:
     if args.command == "serve":
         try:
             import uvicorn
-            from .api import create_app
+            from .api import LOCAL_HOSTS, create_app
         except ImportError as exc:
-            raise RuntimeError("Install the API extra: pip install 'temporal-memory-os[api]'") from exc
+            raise RuntimeError(
+                "Install the API extra from the source checkout: pip install -e '.[api]'") from exc
+        if args.host not in LOCAL_HOSTS:
+            if not os.environ.get("MEMORYOS_API_TOKEN"):
+                print("Warning: serving on {} without MEMORYOS_API_TOKEN lets anyone who can "
+                      "reach this port read and change memory.".format(args.host), file=sys.stderr)
+            if not os.environ.get("MEMORYOS_ALLOWED_HOSTS"):
+                print("Note: requests must name localhost as their host; add the names other "
+                      "clients use to MEMORYOS_ALLOWED_HOSTS. This check is not access "
+                      "control: only the token is.", file=sys.stderr)
         uvicorn.run(create_app(root), host=args.host, port=args.port)
         return None
     if args.command == "mcp":
@@ -98,7 +108,8 @@ def _execute(args: argparse.Namespace) -> Any:
             return history.checkpoint(args.message)
         return history.log(args.limit)
     from .store import MemoryStore
-    with MemoryStore(root) as store:
+    # Only an explicit reindex may set a damaged index aside (see MemoryStore).
+    with MemoryStore(root, repair_index=args.command == "reindex") as store:
         if args.command == "init":
             return {"root": str(root), "facts": len(store.all_facts())}
         if args.command == "add":
@@ -126,12 +137,15 @@ def _execute(args: argparse.Namespace) -> Any:
         from .extraction import ProposalQueue
         queue = ProposalQueue(store)
         if args.command == "extract":
-            text = args.file.read_text(encoding="utf-8") if args.file else args.text
+            text = args.file.read_text(encoding="utf-8-sig") if args.file else args.text
             return [proposal.to_dict() for proposal in queue.extract(
                 text, args.source, observed_at=args.observed_at, topic=args.topic)]
         if args.command == "proposals":
-            return [proposal.to_dict() for proposal in queue.list(
+            listed = [proposal.to_dict() for proposal in queue.list(
                 status=None if args.status == "all" else args.status)]
+            for problem in queue.problems:  # Damaged files are skipped, not hidden.
+                print(json.dumps({"warning": problem}, ensure_ascii=False), file=sys.stderr)
+            return listed
         if args.command == "approve":
             return queue.approve(args.id).to_dict()
         if args.command == "reject":
@@ -146,7 +160,13 @@ def main(argv: list[str] | None = None) -> int:
         if result is not None:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
-    except (ValueError, KeyError, OSError, RuntimeError) as exc:
+    except KeyError as exc:
+        missing = exc.args[0] if exc.args else ""
+        message = missing if str(missing).startswith("Proposal not found") else (
+            "Memory record not found: {}".format(missing))
+        print(json.dumps({"error": message}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    except (ValueError, OSError, RuntimeError, ImportError, sqlite3.Error) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 1
     except KeyboardInterrupt:

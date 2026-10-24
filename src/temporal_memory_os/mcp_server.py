@@ -7,7 +7,9 @@ The server only speaks MCP on stdout. SDK diagnostics go to stderr.
 import json
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Literal, Optional, Union
+
+from . import __version__
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -20,13 +22,19 @@ def create_server(root: Union[str, Path, None] = None) -> "FastMCP":
         from mcp.types import ToolAnnotations
     except ImportError as exc:
         raise RuntimeError(
-            "MCP support requires Python 3.10+ and: pip install 'temporal-memory-os[mcp]'"
+            "MCP support needs Python 3.10+ and the mcp extra; from a source checkout: "
+            "pip install -e '.[mcp]'"
         ) from exc
 
+    from .embeddings import create_embedder
     from .store import MemoryStore
-    from .retrieval import HybridRetriever
+    from .retrieval import HybridRetriever, VectorCache, default_threshold
 
-    memory_root = Path(root or os.environ.get("MEMORYOS_HOME", "./memory-data"))
+    memory_root = Path(root or os.environ.get("MEMORYOS_HOME") or "./memory-data")
+    threshold = default_threshold()  # A bad setting stops the server now.
+    # One embedder (and model) and one vector cache for the life of the server.
+    embedder = create_embedder()
+    vectors = VectorCache()
     server = FastMCP(
         "Temporal MemoryOS",
         instructions=(
@@ -38,6 +46,9 @@ def create_server(root: Union[str, Path, None] = None) -> "FastMCP":
             "are exposed."
         ),
     )
+    low_level = getattr(server, "_mcp_server", None)
+    if low_level is not None:
+        low_level.version = __version__  # Report this package's version, not the SDK's.
     read_only = ToolAnnotations(
         readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
     )
@@ -48,12 +59,13 @@ def create_server(root: Union[str, Path, None] = None) -> "FastMCP":
         as_of: Optional[str] = None,
         known_at: Optional[str] = None,
         limit: int = 5,
-        mode: str = "hybrid",
+        mode: Literal["keyword", "semantic", "graph", "hybrid"] = "hybrid",
         entity: Optional[str] = None,
     ) -> dict:
         """Search time-valid memories. Dates accept ISO timestamps or YYYY-MM-DD."""
         with MemoryStore(memory_root) as store:
-            matches = HybridRetriever(store).search(
+            matches = HybridRetriever(store, embedder=embedder, semantic_threshold=threshold,
+                                      vector_cache=vectors).search(
                 query, as_of=as_of, known_at=known_at, limit=limit, mode=mode, entity=entity
             )
             return {
@@ -75,7 +87,10 @@ def create_server(root: Union[str, Path, None] = None) -> "FastMCP":
     def fetch(id: str) -> dict:
         """Fetch a complete audit fact by ID, including provenance and dates."""
         with MemoryStore(memory_root) as store:
-            fact = store.get(id)
+            try:
+                fact = store.get(id)
+            except KeyError:
+                raise ValueError("Memory record not found: {}".format(id)) from None
             return {
                 "id": fact.id,
                 "title": "{} · {}".format(fact.entity, fact.attribute),

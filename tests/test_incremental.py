@@ -3,9 +3,11 @@
 import os
 import shutil
 import sqlite3
+from contextlib import closing
 
 import pytest
 
+from temporal_memory_os import store as store_module
 from temporal_memory_os.embeddings import HashingEmbedder
 from temporal_memory_os.retrieval import HybridRetriever
 from temporal_memory_os.store import MemoryConflictError, MemoryStore
@@ -35,8 +37,8 @@ def test_write_after_external_edit_sees_the_edited_record(store):
 def test_write_after_invalid_external_edit_fails_without_partial_index(store):
     tea = store.add("person", "drink", "tea", valid_from="2025-01-01")
     path = store.path_for(tea.id)
-    path.write_text(path.read_text(encoding="utf-8").replace('"confidence": 1.0', '"confidence": 9'),
-                    encoding="utf-8")
+    text = path.read_text(encoding="utf-8")
+    path.write_text(text.replace('"confidence": 1.0', '"confidence": 9'), encoding="utf-8")
     with pytest.raises(ValueError, match="confidence"):
         store.add("person", "city", "Riverton", valid_from="2025-01-01")
     assert [fact.value for fact in store.all_facts()] == ["tea"]
@@ -150,3 +152,26 @@ def test_symlinked_folder_inside_memory_is_rejected(tmp_path):
         (store.memory_dir / "linked").symlink_to(outside, target_is_directory=True)
         with pytest.raises(ValueError, match="symbolic links"):
             store.refresh()
+
+
+def test_reading_an_unchanged_store_never_waits_for_a_writer(tmp_path, monkeypatch):
+    with MemoryStore(tmp_path) as store:
+        tea = store.add("person", "drink", "tea", valid_from="2025-01-01")
+    index = tmp_path / ".memoryos" / "index.sqlite3"
+    # Files verified well after they last changed, the usual state seconds after a
+    # write, are trusted without hashing them again (which would take the write lock).
+    with closing(sqlite3.connect(str(index))) as connection:
+        connection.execute("UPDATE sources SET verified_ns = mtime_ns + 60000000000")
+        connection.commit()
+    monkeypatch.setattr(store_module, "_LOCK_RETRY_SECONDS", 1.0)  # Any wait fails fast.
+    with MemoryStore(tmp_path) as opened_before, \
+            closing(sqlite3.connect(str(index), isolation_level=None)) as writer:
+        writer.execute("BEGIN IMMEDIATE")  # What a write or a Git checkpoint holds.
+        try:
+            assert opened_before.refresh() is False
+            with MemoryStore(tmp_path) as opened_during:
+                assert opened_during.get(tea.id).value == "tea"
+                assert [fact.value for fact in opened_during.snapshot(as_of="2025-02-01")] == [
+                    "tea"]
+        finally:
+            writer.execute("ROLLBACK")

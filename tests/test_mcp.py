@@ -95,3 +95,24 @@ def test_mcp_read_only_temporal_search_fetch_and_history(tmp_path):
     asyncio.run(scenario())
     with MemoryStore(tmp_path) as store:
         assert [fact.to_dict() for fact in store.all_facts()] == original_records
+
+
+def test_fetch_of_a_missing_record_names_it(tmp_path):
+    missing = "0123456789abcdef0123456789abcdef"
+
+    async def scenario():
+        server = create_server(tmp_path)
+        async with create_connected_server_and_client_session(server) as session:
+            result = await session.call_tool("fetch", {"id": missing})
+            assert result.isError
+            [content] = result.content
+            assert content.text.endswith("Memory record not found: " + missing)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("configured", ["high", "2", "nan"])
+def test_bad_semantic_threshold_stops_the_server_at_start_up(tmp_path, monkeypatch, configured):
+    monkeypatch.setenv("MEMORYOS_SEMANTIC_THRESHOLD", configured)
+    with pytest.raises(ValueError, match="MEMORYOS_SEMANTIC_THRESHOLD must be a number"):
+        create_server(tmp_path)

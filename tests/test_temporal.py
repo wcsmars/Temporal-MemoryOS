@@ -5,7 +5,7 @@ import re
 
 import pytest
 
-from temporal_memory_os.store import MemoryStore
+from temporal_memory_os.store import MemoryConflictError, MemoryStore
 
 
 @pytest.fixture
@@ -112,9 +112,12 @@ def test_retraction_preserves_gap_instead_of_reviving_previous_value(store):
 def test_stale_corrections_and_duplicate_effective_updates_are_rejected(store):
     original = add(store, "pending", "2025-09-01")
     store.correct(original.id, "withdrawn", recorded_at="2025-09-20")
-    with pytest.raises(ValueError):
+    # Each message names the action to take on the latest revision instead.
+    with pytest.raises(MemoryConflictError, match="correct the latest revision instead"):
         store.correct(original.id, "invited", recorded_at="2025-09-21")
-    with pytest.raises(ValueError):
+    with pytest.raises(MemoryConflictError, match="retract the latest revision instead"):
+        store.retract(original.id, recorded_at="2025-09-21")
+    with pytest.raises(MemoryConflictError, match="use correct"):
         add(store, "another value", "2025-09-01", "2025-09-22")
 
 
@@ -174,6 +177,6 @@ def test_provenance_and_relations_survive_reopening(tmp_path):
         restored = store.get(fact.id)
         assert restored.source == "synthetic://test/conversation"
         assert restored.evidence == fact.evidence
-        assert restored.tags == ["career", "synthetic"]
-        assert restored.links == ["Example employer"]
+        assert restored.tags == ("career", "synthetic")
+        assert restored.links == ("Example employer",)
         assert restored.confidence == 0.8

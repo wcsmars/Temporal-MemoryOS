@@ -2,12 +2,35 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Dict, List, Optional
 
-
+# Git must use an identity someone configured (in Git's config files or the
+# standard GIT_AUTHOR_*/GIT_COMMITTER_* variables), never one it guesses from
+# the account name and hostname.
 _EXPLICIT_IDENTITY = ("-c", "user.useConfigOnly=true")
+# Variables that point Git at a different repository, index or object store.
+# A caller's shell (a Git hook, an IDE terminal) may export them; they must
+# never redirect private memory into another repository.
+_LOCATION_VARIABLES = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_PREFIX",
+    # Pathspec modes change how "memory" and "proposals" are matched.
+    "GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS",
+)
+_MARKER_KEY = "memoryos.checkpoints"
+_EXCLUDE_HEADER = "# Temporal MemoryOS derived/local files"
+# Dot-named files are editor locks, swap files and interrupted writes; the
+# store ignores them, so checkpoints do too. Temporary files and editor backups
+# ("notes.md~", "#notes.md#") are left out as well. "!*.tmp/" keeps a topic
+# folder named like "notes.tmp" in: "*.tmp" alone would hide its records.
+_EXCLUDES = (".memoryos/", "*.sqlite3*", ".env", "proposals/.lock", "*.tmp", "!*.tmp/",
+             "/memory/**/.*", "/proposals/.*", "/memory/**/*~", "/memory/**/#*#")
+_TARGETS = ("memory", "proposals")
+_TIMEOUT = 600
 
 
 class GitHistory:
@@ -16,100 +39,178 @@ class GitHistory:
     def __init__(self, root: str | Path):
         self.root = Path(root).expanduser().resolve()
 
-    def _git(self, *arguments: str, check: bool = True) -> subprocess.CompletedProcess:
+    def _git(self, *arguments: str, check: bool = True, stdin: Optional[str] = None
+             ) -> subprocess.CompletedProcess:
         if not shutil.which("git"):
             raise RuntimeError("Git is not installed; install Git to use checkpoints.")
-        result = subprocess.run(
-            ["git", "-C", str(self.root), *arguments],
-            text=True, capture_output=True, timeout=30,
-        )
+        environment: Dict[str, str] = {key: value for key, value in os.environ.items()
+                                       if key not in _LOCATION_VARIABLES}
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(self.root), *arguments], input=stdin, env=environment,
+                text=True, capture_output=True, timeout=_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # A killed Git command can leave .git/index.lock behind. It is not
+            # removed here: the lock could belong to a Git command you started.
+            raise RuntimeError(
+                "Git did not finish within {} seconds. If no other Git command is running in "
+                "this memory directory, delete .git/index.lock there before the next "
+                "checkpoint.".format(_TIMEOUT)) from exc
         if check and result.returncode:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Git failed.")
         return result
 
-    def _require_own_repository(self) -> None:
+    def _toplevel(self) -> Optional[Path]:
         result = self._git("rev-parse", "--show-toplevel", check=False)
-        if result.returncode or Path(result.stdout.strip()).resolve() != self.root:
+        return None if result.returncode else Path(result.stdout.strip()).resolve()
+
+    def _owned(self) -> bool:
+        """True for a repository MemoryOS created, or a clone of one."""
+        if self._git("config", "--local", "--get", _MARKER_KEY, check=False).stdout.strip() == "true":
+            return True
+        exclude = self._exclude_path()
+        if exclude.is_file() and _EXCLUDE_HEADER in exclude.read_text(encoding="utf-8"):
+            return True  # Created before the marker existed.
+        tracked = [name for name in self._git("ls-files", "-z").stdout.split("\x00") if name]
+        return bool(tracked) and all(name.split("/", 1)[0] in _TARGETS for name in tracked)
+
+    def _exclude_path(self) -> Path:
+        location = self._git("rev-parse", "--git-path", "info/exclude").stdout.strip()
+        path = Path(location)
+        return path if path.is_absolute() else self.root / path
+
+    def _adopt(self) -> None:
+        """Mark the repository as MemoryOS's and make sure local files stay out of it.
+
+        Nothing is written when both are already in place, so concurrent
+        checkpoints do not compete for Git's config lock.
+        """
+        if self._git("config", "--local", "--get", _MARKER_KEY, check=False).stdout.strip() != "true":
+            self._git("config", "--local", _MARKER_KEY, "true")
+        exclude = self._exclude_path()
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        present = exclude.read_text(encoding="utf-8").splitlines() if exclude.is_file() else []
+        kept = list(present)
+        missing = [rule for rule in _EXCLUDES if rule not in kept]
+        if missing or kept != present:
+            lines = kept + ([] if _EXCLUDE_HEADER in kept else ["", _EXCLUDE_HEADER]) + missing
+            exclude.write_text("\n".join(lines).strip("\n") + "\n", encoding="utf-8")
+
+    def _is_root(self, path: Optional[Path]) -> bool:
+        # samefile: on case-insensitive file systems Git may spell the folder differently.
+        try:
+            return path is not None and os.path.samefile(path, self.root)
+        except OSError:
+            return False
+
+    def _require_own_repository(self) -> None:
+        toplevel = self._toplevel()
+        if not self._is_root(toplevel):
             raise ValueError("This memory directory needs its own repository. Run git-init first.")
+        if not self._owned():
+            raise ValueError(
+                "This repository was not created by `memoryos git-init`. If it holds only this "
+                "memory directory and you want checkpoints committed to it, mark it with: git -C "
+                "<memory directory> config memoryos.checkpoints true")
 
     def initialize(self) -> dict:
         self.root.mkdir(parents=True, exist_ok=True)
-        existing = self._git("rev-parse", "--show-toplevel", check=False)
-        if not existing.returncode:
-            if Path(existing.stdout.strip()).resolve() != self.root:
+        toplevel = self._toplevel()
+        if toplevel is not None:
+            if not self._is_root(toplevel):
                 raise ValueError(
                     "The memory directory is inside another Git repository. Choose a separate "
-                    "directory outside it before enabling memory checkpoints."
-                )
+                    "directory outside it before enabling memory checkpoints.")
+            if not self._owned():
+                raise ValueError(
+                    "This directory is already a Git repository that MemoryOS did not create "
+                    "(for example a project repository). Use a separate memory directory, or, if "
+                    "this repository holds only memory, mark it with: git -C <memory directory> "
+                    "config memoryos.checkpoints true")
+            self._adopt()
             return {"initialized": False, "root": str(self.root)}
         self._git("init", "--quiet")
-        # These defaults are repository-local and contain no identity information.
-        exclude = self.root / ".git" / "info" / "exclude"
-        with exclude.open("a", encoding="utf-8") as handle:
-            handle.write("\n# Temporal MemoryOS derived/local files\n.memoryos/\n*.sqlite3*\n.env\nproposals/.lock\n")
+        # These settings are repository-local and contain no identity information.
+        self._adopt()
         return {"initialized": True, "root": str(self.root)}
+
+    @staticmethod
+    def _publishable(name: str) -> bool:
+        # Dot files are editor locks, swap files or interrupted writes; the
+        # store ignores them too.
+        return bool(name) and not any(part.startswith(".") for part in name.split("/"))
 
     def checkpoint(self, message: str) -> dict:
         if not message.strip():
             raise ValueError("A non-empty checkpoint message is required.")
         self._require_own_repository()
-        targets = []
-        for name in ("memory", "proposals"):
+        targets: List[str] = []
+        for name in _TARGETS:
             path = self.root / name
             if path.is_symlink() or (path.exists() and not path.is_dir()):
                 raise ValueError(f"Checkpoint target {name!r} must be a directory.")
             if path.exists():
-                if any(entry.is_symlink() for entry in path.rglob("*")):
+                if any(entry.is_symlink() for entry in path.rglob("*")
+                       if self._publishable(entry.relative_to(self.root).as_posix())):
                     raise ValueError("Checkpoint directories cannot contain symbolic links.")
             targets.append(name)
         # Check the effective identity before altering the index. Environment identities
         # are supported; missing identity is never guessed or written to Git config.
-        # useConfigOnly stops Git from inventing an identity from the account
-        # name and hostname, which would otherwise end up in commit history.
         identity = self._git(*_EXPLICIT_IDENTITY, "var", "GIT_AUTHOR_IDENT", check=False)
         committer = self._git(*_EXPLICIT_IDENTITY, "var", "GIT_COMMITTER_IDENT", check=False)
         if identity.returncode or committer.returncode:
             raise ValueError(
-                "Configure user.name and user.email in this memory repository before "
-                "checkpointing, or provide Git author/committer environment variables."
-            )
-        # Enumerate tracked and unignored files so transient proposal files stay
-        # excluded even in a repository that predates our local ignore patterns.
-        candidates = self._git(
-            "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", *targets
-        ).stdout.split("\x00")
-        stage_paths = sorted({name for name in candidates if name
-                              and name != "proposals/.lock"
-                              and not (name.startswith("proposals/") and name.endswith(".tmp"))})
-        if stage_paths:
-            self._git("add", "--all", "--", *[":(literal)" + name for name in stage_paths])
+                "Configure user.name and user.email in Git (globally or in this memory "
+                "repository) before checkpointing, or provide Git author/committer "
+                "environment variables.")
+        # Hold the memory write lock and the proposal lock while staging, so a
+        # checkpoint never captures an approved proposal without its fact. Reads
+        # and searches go on meanwhile; writes and approvals wait for it.
+        from .extraction import ProposalQueue
+        from .store import MemoryStore
+        with MemoryStore(self.root) as store:
+            queue = ProposalQueue(store)
+            with queue._lock(), store._transaction():
+                self._adopt()  # Inside the locks, so checkpoints never race on it.
+                return self._commit(message, targets)
+
+    def _commit(self, message: str, targets: List[str]) -> dict:
+        # Stage whole folders: the repository's exclude rules keep locks, temporary
+        # and dot files out. Per-file pathspecs would cost time quadratic in the
+        # number of records.
+        def known(name: str) -> bool:
+            return bool(self._git("ls-files", "--", name).stdout.strip())
+
+        # A folder that is absent and was never committed has nothing to stage.
+        tracked = {name for name in targets if known(name)}
+        present = [name for name in targets if (self.root / name).is_dir() or name in tracked]
+        if present:
+            self._git("add", "--all", "--", *present)
+        # Commit folders that had or now have tracked files (a deletion counts).
+        targets = [name for name in present if name in tracked or known(name)]
+        if not targets:
+            return {"committed": False, "reason": "No memory changes."}
         changes = self._git("diff", "--cached", "--quiet", "--", *targets, check=False)
         if changes.returncode == 0:
             return {"committed": False, "reason": "No memory changes."}
         if changes.returncode != 1:
             raise RuntimeError(changes.stderr.strip() or "Unable to inspect staged memory changes.")
-        changed_paths = [name for name in self._git(
-            "diff", "--cached", "--name-only", "-z", "--", *targets
-        ).stdout.split("\x00") if name and name != "proposals/.lock"
-            and not (name.startswith("proposals/") and name.endswith(".tmp"))]
-        if not changed_paths:
-            return {"committed": False, "reason": "No memory changes."}
         # --only keeps any unrelated, already-staged files out of this commit.
         self._git(*_EXPLICIT_IDENTITY, "commit", "--only", "--quiet", "-m", message, "--",
-                  *[":(literal)" + name for name in changed_paths])
+                  *targets)
         commit = self._git("rev-parse", "HEAD").stdout.strip()
         return {"committed": True, "commit": commit, "message": message}
 
     def log(self, limit: int = 20) -> list[dict]:
-        if not 1 <= limit <= 1000:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
             raise ValueError("Log limit must be between 1 and 1000.")
         self._require_own_repository()
         if self._git("rev-parse", "--verify", "HEAD", check=False).returncode:
             return []
-        # JSON-escaped subjects from Git are not supported; NUL separates arbitrary
-        # commit messages safely without interpreting them as shell commands.
+        # NUL separates arbitrary commit messages safely without interpreting them.
         result = self._git(
-            "log", f"-{limit}", "--format=%H%x00%aI%x00%s%x00", "--", "memory", "proposals"
+            "log", f"-{limit}", "--format=%H%x00%aI%x00%s%x00", "--", *_TARGETS
         )
         parts = result.stdout.split("\x00")
         output = []

@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.2.2
+
+Fixes found by a full audit of the code, documentation and release process.
+
+Memory store
+- Times are parsed with one explicit grammar (ASCII digits only), so the same strings are accepted on every supported Python version. Forms that 0.2.0 accepted only on Python 3.11 or later, such as compact dates, are now rejected everywhere. Out-of-range times and timestamps at the end of the representable range are validation errors, not crashes.
+- A failed `COMMIT` no longer leaves the new Markdown record behind. Records, their folders and new topic folders are flushed with `fsync`.
+- A damaged index stops with a message; `memoryos reindex` sets it aside and rebuilds it. Locks, read-only files and full disks are never mistaken for damage. Concurrent first opens retry instead of failing with "database is locked". The index file is owner-readable only, including indexes created by older releases.
+- Opening a store whose files have not changed no longer waits for a writer such as a running checkpoint.
+- Dot-named files and folders (editor lock and swap files, hidden tool folders) are ignored. Notes are never decoded as records, so any encoding works. A file that held a record and lost its JSON block is reported instead of silently dropped. Records may use a byte-order mark and CRLF or CR line endings; a damaged record behind a byte-order mark, or a record saved as UTF-16 or UTF-32, is reported instead of skipped as a note, and so is a deeply nested record. A file name that is not valid UTF-8 is reported by name instead of stopping the store with an unrelated error. An index from 0.2.0 or 0.2.1 is read again from Markdown once on upgrade, because those releases skipped such records.
+- A symbolic link under `memory/` is rejected even if it was swapped for a plain file while the index was being rebuilt. A link in place of the index's log files is rejected, and opening a store never changes the permissions of a file such a link points to.
+- A datetime whose time zone gives no offset is read as UTC, like a naive one, instead of as the computer's local time.
+- Error messages name the files involved, relative to the memory directory; problems in the files on disk are reported by the HTTP API as 503 and no longer disclose absolute paths.
+- A record imported with a timestamp ahead of the local clock can be corrected and retracted, and does not hide new writes from current queries.
+- `correct()` accepts `confidence` and `topic`; new `audit_trail()`. Tags and links are immutable tuples, and a single string is rejected instead of being split into letters.
+
+Retrieval
+- Rank fusion uses competition ranks: tied scores share a rank. Before, ties became rank differences decided by random fact IDs, which could change the top result of the default search.
+- Document vectors are cached by model and exact text, compactly; the HTTP and MCP servers keep one model and cache per process instead of rebuilding them, and reloading a learned model, on every request. A model in the local cache loads without network access.
+- Unicode-aware tokenizing (NFKC and case folding; combining marks stay inside words); keyword matching ignores accents. Common question words no longer make every fact match, while entity names made of such words ("The Who") are still found.
+- Graph seeding tells apart names that share their words (C, C#, C++) and accepts names written only in symbols. A name counts as written out in quotes or brackets and with trailing punctuation or a possessive ("C++", St. Louis, Yahoo!, C++'s), and matching stays linear in the query's length.
+- `MEMORYOS_SEMANTIC_THRESHOLD`; a threshold too large for a float, or embedding vectors whose length overflows, is a `ValueError` like any other out-of-range value; a model that cannot load raises `EmbeddingUnavailableError` (HTTP 503 without details, CLI JSON error).
+
+Review queue
+- Approving a dated conversation in order works when the attribute already had an earlier value. Approving again after an interruption recognizes the fact already written. Stale approvals, including an edited record that kept its ID, return HTTP 409, as documented, also when a newer approved value from the same source is present. In-order approval also accepts a later line that repeats the value already in effect (nothing new is written) or returns to an earlier value.
+- Damaged proposal files are reported by name and skipped, so one bad file no longer blocks the queue. Lines with `|` that are not structured facts, lines with invalid or conflicting dates, and dated comments are skipped instead of aborting the extraction or becoming facts. Re-extracting undated lines returns the pending proposals instead of duplicates, unless a value has taken effect since (a value planned for later does not count). This also holds for proposals saved by 0.2.1 and for an empty or blank observation time, which means now. Text or a source that is not valid Unicode is rejected instead of yielding no proposals, and a proposal file holding such text, or nested too deeply to read, is reported like other damaged files. A time edited by hand in a proposal file may use any accepted form. Correction approvals keep the record's topic folder.
+- Proposals extracted within one clock tick list in line order.
+
+Interfaces
+- Git checkpoints: inherited `GIT_DIR`-style and pathspec variables can no longer redirect or break a checkpoint; stores with tens of thousands of files are staged in linear time without hitting the argument limit; checkpoints wait for in-flight writes and approvals; temporary files, dot files and editor backups are never committed, while topic folders with any name are; `git-init` refuses an existing repository it did not create, and a repository you created yourself can be opted in. A Git timeout explains how to clear the lock it may leave.
+- The HTTP API only answers requests addressed to localhost or to hosts listed in `MEMORYOS_ALLOWED_HOSTS`, and refuses cross-site requests that would change memory; `serve` warns when exposed without a token.
+- CLI errors stay in the JSON error format; an empty `MEMORYOS_HOME` means the default directory; the demo never fails half way.
+- Install hints point to the source checkout (the package is not published on PyPI). The `semantic` extra requires PyTorch 2.6 or later where it is available. Development dependencies install on Python 3.10.
+
+Verification
+- Regression tests for every fix above, tests for the release tooling, and benchmarks that report cold (one command) and warm (long-lived process) search separately and fail in CI if accuracy or charts drift.
+- Every mutant that survived a full mutation-testing run was reviewed by hand and the verdict checked by a second reviewer. The review added tests for the behavior no earlier test checked (`tests/*_pins.py`) and found many of the fixes above; the remaining survivors are equivalent or change only message wording (see the README).
+
 ## 0.2.1
 
 - Fix: `checkpoint` no longer lets Git invent an author from the computer's account name and hostname when no identity is configured. It now requires `user.name`/`user.email` in the memory repository or the standard Git environment variables, as documented.

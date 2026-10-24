@@ -1,51 +1,84 @@
 {
-  "benchmark": "scale_latency_v1",
+  "benchmark": "scale_latency_v2",
   "label": "v0.1",
   "version": "0.1.0",
-  "generated_at": "2026-10-23T05:28:23.415189+00:00",
+  "package": {
+    "version": "0.1.0",
+    "location": "build/lib/temporal_memory_os",
+    "use_installed": true,
+    "source_sha256": "8ec0113fa0e38e07215138fb5adeb0dd3047e0c0329a3737e26c80bcf55ab815"
+  },
+  "generated_at": "2026-10-24T17:49:20.280125+00:00",
   "environment": {
     "python": "3.11.7",
     "system": "Darwin",
-    "machine": "arm64"
+    "machine": "arm64",
+    "cpu_count": 12,
+    "load_average_1m_at_start": 3.94
+  },
+  "parameters": {
+    "sizes": [
+      300,
+      1000,
+      3000,
+      10000
+    ],
+    "writes": 20,
+    "searches": 20,
+    "settle_seconds": 3.5
   },
   "workload": "Three dated status records per synthetic entity; hybrid search with valid-time and knowledge-time filters; offline lexical embeddings.",
+  "metrics": {
+    "first_open_ms": "Opening the imported corpus for the first time: every record is validated and indexed.",
+    "open_unchanged_ms": "Median of 5 opens of a store whose files have not changed.",
+    "full_rebuild_ms": "Median of 3 forced rebuilds that validate every record.",
+    "write_ms_median": "Adding one fact to an open store.",
+    "warm_search_ms_median": "One hybrid search through a store and retriever reused for every search; the first search fills their caches.",
+    "cold_search_ms_median": "Open the store, create a new retriever, run one hybrid search and close the store, like one CLI call, excluding interpreter start-up."
+  },
   "notes": [
     "Single local run per size; medians over repeated operations.",
     "Writes are measured after imported files leave the recently-modified window.",
+    "Every search result is checked for the expected entity, value and record ID.",
+    "Cold searches exclude interpreter start-up and imports; the operating system's file cache is warm.",
     "Timings are machine-specific and not comparable across hardware."
   ],
   "results": [
     {
       "facts": 300,
-      "first_open_ms": 56.222,
-      "open_unchanged_ms": 39.955,
-      "full_rebuild_ms": 39.262,
-      "write_ms_median": 39.153,
-      "search_ms_median": 15.088
+      "first_open_ms": 40.041,
+      "open_unchanged_ms": 35.678,
+      "full_rebuild_ms": 37.633,
+      "write_ms_median": 37.706,
+      "warm_search_ms_median": 14.575,
+      "cold_search_ms_median": 55.843
     },
     {
       "facts": 1000,
-      "first_open_ms": 123.062,
-      "open_unchanged_ms": 129.927,
-      "full_rebuild_ms": 122.576,
-      "write_ms_median": 127.245,
-      "search_ms_median": 48.064
+      "first_open_ms": 120.187,
+      "open_unchanged_ms": 121.842,
+      "full_rebuild_ms": 119.171,
+      "write_ms_median": 123.768,
+      "warm_search_ms_median": 47.321,
+      "cold_search_ms_median": 174.603
     },
     {
       "facts": 3000,
-      "first_open_ms": 422.639,
-      "open_unchanged_ms": 395.67,
-      "full_rebuild_ms": 375.642,
-      "write_ms_median": 398.619,
-      "search_ms_median": 148.07
+      "first_open_ms": 366.489,
+      "open_unchanged_ms": 381.654,
+      "full_rebuild_ms": 376.269,
+      "write_ms_median": 377.46,
+      "warm_search_ms_median": 144.662,
+      "cold_search_ms_median": 535.964
     },
     {
       "facts": 10000,
-      "first_open_ms": 1307.747,
-      "open_unchanged_ms": 1374.13,
-      "full_rebuild_ms": 1351.096,
-      "write_ms_median": 1388.822,
-      "search_ms_median": 500.95
+      "first_open_ms": 1261.671,
+      "open_unchanged_ms": 1303.89,
+      "full_rebuild_ms": 1273.286,
+      "write_ms_median": 1286.015,
+      "warm_search_ms_median": 496.436,
+      "cold_search_ms_median": 1779.898
     }
   ]
 }

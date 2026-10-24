@@ -1,6 +1,6 @@
 {
   "benchmark": "synthetic_temporal_smoke_v2",
-  "generated_at": "2026-10-23T05:25:57.385140+00:00",
+  "generated_at": "2026-10-24T17:50:30.093868+00:00",
   "corpus": {
     "state_changes": {
       "entities": 50,
@@ -12,7 +12,7 @@
       "entities": 50,
       "records": 100,
       "queries": 100,
-      "description": "One status per entity, corrected later at the same effective date; the same day is queried with knowledge from before and after the correction."
+      "description": "One status per entity, effective 2025-01-01 and corrected weeks later with the same effective date; the state on 2025-01-15, two weeks after that date, is queried with knowledge from before and after the correction."
     }
   },
   "semantic_backend": "Default offline lexical hashing; no learned semantic model.",
@@ -26,7 +26,7 @@
     "top1_fact_accuracy": "Fraction retrieving the expected version's exact fact ID.",
     "stale_hit_rate": "Fraction returning the correct entity/attribute but the wrong version; includes future-state and future-knowledge leakage.",
     "retrieval_coverage": "Fraction with at least one returned result.",
-    "latency": "Warm-process retrieval only; excludes corpus construction and indexing."
+    "latency": "Warm-process retrieval only (one retriever answers every query); excludes corpus construction and indexing. p95 uses the nearest-rank method."
   },
   "limitations": [
     "Synthetic exact-entity queries; not a language-model answer-quality benchmark.",
@@ -44,8 +44,8 @@
         "top1_fact_accuracy": 0.3333333333333333,
         "stale_hit_rate": 0.6666666666666666,
         "retrieval_coverage": 1.0,
-        "latency_ms_median": 0.226,
-        "latency_ms_p95": 0.276,
+        "latency_ms_median": 0.227,
+        "latency_ms_p95": 0.231,
         "example_errors": [
           {
             "query": "candidate0000 application_status",
@@ -73,8 +73,8 @@
         "top1_fact_accuracy": 0.3333333333333333,
         "stale_hit_rate": 0.6666666666666666,
         "retrieval_coverage": 1.0,
-        "latency_ms_median": 0.078,
-        "latency_ms_p95": 0.088,
+        "latency_ms_median": 0.08,
+        "latency_ms_p95": 0.081,
         "example_errors": [
           {
             "query": "candidate0000 application_status",
@@ -102,8 +102,8 @@
         "top1_fact_accuracy": 1.0,
         "stale_hit_rate": 0.0,
         "retrieval_coverage": 1.0,
-        "latency_ms_median": 0.921,
-        "latency_ms_p95": 1.245,
+        "latency_ms_median": 0.998,
+        "latency_ms_p95": 1.107,
         "example_errors": []
       },
       "temporal_hybrid": {
@@ -112,8 +112,8 @@
         "top1_fact_accuracy": 1.0,
         "stale_hit_rate": 0.0,
         "retrieval_coverage": 1.0,
-        "latency_ms_median": 0.905,
-        "latency_ms_p95": 1.111,
+        "latency_ms_median": 0.97,
+        "latency_ms_p95": 1.022,
         "example_errors": []
       }
     },
@@ -124,8 +124,8 @@
         "top1_fact_accuracy": 0.5,
         "stale_hit_rate": 0.5,
         "retrieval_coverage": 1.0,
-        "latency_ms_median": 0.142,
-        "latency_ms_p95": 0.156,
+        "latency_ms_median": 0.139,
+        "latency_ms_p95": 0.144,
         "example_errors": [
           {
             "query": "applicant0000 application_status",
@@ -154,7 +154,7 @@
         "stale_hit_rate": 0.5,
         "retrieval_coverage": 1.0,
         "latency_ms_median": 0.072,
-        "latency_ms_p95": 0.085,
+        "latency_ms_p95": 0.079,
         "example_errors": [
           {
             "query": "applicant0000 application_status",
@@ -182,8 +182,8 @@
         "top1_fact_accuracy": 0.5,
         "stale_hit_rate": 0.5,
         "retrieval_coverage": 1.0,
-        "latency_ms_median": 0.701,
-        "latency_ms_p95": 1.015,
+        "latency_ms_median": 0.768,
+        "latency_ms_p95": 0.816,
         "example_errors": [
           {
             "query": "applicant0000 application_status",
@@ -211,8 +211,8 @@
         "top1_fact_accuracy": 1.0,
         "stale_hit_rate": 0.0,
         "retrieval_coverage": 1.0,
-        "latency_ms_median": 0.679,
-        "latency_ms_p95": 0.943,
+        "latency_ms_median": 0.757,
+        "latency_ms_p95": 0.779,
         "example_errors": []
       }
     }

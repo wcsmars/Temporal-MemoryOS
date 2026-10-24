@@ -11,11 +11,16 @@ different ways:
   answer, unless it is a retraction or its explicit end has passed.
 
 The model also predicts which writes must be rejected, and with which error.
+Every history starts with a seeded batch of writes, so it never stays empty.
+After every step, full snapshots at a few fixed time pairs are compared with
+the model; random steps compare other snapshots, histories and searches; and
+the final state is compared with the model at every query time pair.
 """
 
 from __future__ import annotations
 
 import shutil
+import sys
 import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -25,7 +30,9 @@ from typing import Dict, List, Optional, Tuple
 import pytest
 from hypothesis import HealthCheck, assume, event, given, settings
 from hypothesis import strategies as st
-from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, rule
+from hypothesis.stateful import (
+    RuleBasedStateMachine, initialize, invariant, precondition, rule,
+)
 
 from temporal_memory_os.embeddings import HashingEmbedder
 from temporal_memory_os.extraction import ProposalQueue
@@ -56,6 +63,21 @@ TEXT = st.text(
 ).filter(lambda text: text.strip() != "")
 VALUES = st.one_of(st.sampled_from(["pending", "tea", "Riverton", "<!-- memoryos:fact:v1 -->",
                                     "```", "```json"]), TEXT)
+# Arguments of one add, shared by the add rule and the seeded first batch.
+ADD_ARGUMENTS = dict(
+    entity=st.sampled_from(ENTITIES), attribute=st.sampled_from(ATTRIBUTES), value=VALUES,
+    start=st.sampled_from(DAYS[:6]), span=SPANS, recorded=st.sampled_from(DAYS),
+    topic=st.sampled_from(TOPICS), evidence=TEXT,
+    links=st.lists(st.sampled_from(ENTITIES), max_size=2),
+)
+# Seeded adds never have an empty span, so the first one always succeeds. The
+# add rule still draws empty spans and other rejected writes.
+SEED_ADD = st.fixed_dictionaries(
+    {**ADD_ARGUMENTS, "span": st.one_of(st.none(), st.integers(min_value=1, max_value=4))})
+# (as_of, known_at) pairs compared with the model after every step: before any
+# assertion starts, mid-history with partial and with full knowledge, and the end.
+CHECKED_EVERY_STEP = [("2024-12-31", "2025-01-08"), ("2025-01-04", "2025-01-03"),
+                      ("2025-01-03T12:00:00Z", "2025-01-08"), ("2025-01-10", "2025-01-08")]
 
 
 @dataclass(frozen=True)
@@ -115,7 +137,8 @@ class Model:
         return Expected(fact.id, fact.value, min(ends) if ends else None)
 
 
-    def timeline(self, entity: str, attribute: str, known: str) -> List[Tuple[str, str, Optional[str], bool]]:
+    def timeline(self, entity: str, attribute: str,
+                 known: str) -> List[Tuple[str, str, Optional[str], bool]]:
         """The effective history known at ``known``, retractions included."""
         replaced = self.superseded(known)
         live = sorted((fact for fact in self.records.values()
@@ -144,9 +167,19 @@ class TemporalMemoryMachine(RuleBasedStateMachine):
 
     def teardown(self) -> None:
         try:
+            # Hypothesis calls teardown from a ``finally`` block. When a step has
+            # already failed, comparing again would only chain a second error onto
+            # the first, which Hypothesis reports and shrinks as another failure.
+            if sys.exc_info()[1] is not None:
+                return
+            event("records at end: {}".format(
+                "none" if not self.model.records else "1-4" if len(self.model.records) < 5
+                else "5 or more"))
+            # The final state answers every query time pair as the model does.
+            expected = self._all_answers(self.store)
+            assert expected == self._model_answers()
             # Markdown is the source of truth: a fresh process and a forced
             # rebuild must both reproduce every answer.
-            expected = self._all_answers(self.store)
             self.store.reindex()
             assert self._all_answers(self.store) == expected
             with MemoryStore(self.root) as reopened:
@@ -162,6 +195,34 @@ class TemporalMemoryMachine(RuleBasedStateMachine):
                                       for fact in store.snapshot(as_of=as_of, known_at=known)))
                 for as_of in QUERY_TIMES for known in DAYS]
 
+    def _model_answers(self) -> List[Tuple[str, str, List[Tuple[str, str, str]]]]:
+        """The model's version of :meth:`_all_answers`."""
+        return [(as_of, known, sorted((fact.id, fact.value, str(fact.valid_to))
+                                      for fact in self._expected_snapshot(as_of, known).values()))
+                for as_of in QUERY_TIMES for known in DAYS]
+
+    def _expected_snapshot(self, as_of: str, known: str) -> Dict[Tuple[str, str], Fact]:
+        """Full records the model expects in a snapshot, with their derived ends."""
+        moment, cutoff = normalize_time(as_of), normalize_time(known)
+        expected = {}
+        for entity in ENTITIES:
+            for attribute in ATTRIBUTES:
+                answer = self.model.answer(entity, attribute, moment, cutoff)
+                if answer is not None:
+                    record = self.model.records[answer.id]
+                    assert record.value == answer.value
+                    expected[(entity, attribute)] = replace(record, valid_to=answer.valid_to)
+        return expected
+
+    def _check_snapshot(self, as_of: str, known: str) -> int:
+        snapshot = self.store.snapshot(as_of=as_of, known_at=known)
+        actual = {(fact.entity, fact.attribute): fact for fact in snapshot}
+        assert len(actual) == len(snapshot), \
+            "a snapshot holds at most one value per entity/attribute"
+        expected = self._expected_snapshot(as_of, known)
+        assert actual == expected
+        return len(expected)
+
     def _attempt(self, expected_error: Optional[type], write) -> Optional[Fact]:
         event("write rejected: " + (expected_error.__name__ if expected_error else "no"))
         if expected_error is None:
@@ -171,12 +232,22 @@ class TemporalMemoryMachine(RuleBasedStateMachine):
         assert type(caught.value) is expected_error, caught.value
         return None
 
-    @rule(entity=st.sampled_from(ENTITIES), attribute=st.sampled_from(ATTRIBUTES), value=VALUES,
-          start=st.sampled_from(DAYS[:6]), span=SPANS,
-          recorded=st.sampled_from(DAYS), topic=st.sampled_from(TOPICS), evidence=TEXT,
-          links=st.lists(st.sampled_from(ENTITIES), max_size=2))
+    # Swarm testing disables a random subset of rules in each history, often
+    # including ``add``. Initialize rules always run, so every history starts
+    # with at least one record.
+    @initialize(batch=st.lists(SEED_ADD, min_size=1, max_size=6))
+    def seed(self, batch: List[dict]) -> None:
+        for arguments in batch:
+            self._add(**arguments)
+        event("seeded records: {}".format(len(self.model.records)))
+
+    @rule(**ADD_ARGUMENTS)
     def add(self, entity: str, attribute: str, value: str, start: str, span: Optional[int],
             recorded: str, topic: str, evidence: str, links: List[str]) -> None:
+        self._add(entity, attribute, value, start, span, recorded, topic, evidence, links)
+
+    def _add(self, entity: str, attribute: str, value: str, start: str, span: Optional[int],
+             recorded: str, topic: str, evidence: str, links: List[str]) -> None:
         end = None if span is None else shifted(start, span)
         valid_from = normalize_time(start)
         valid_to = None if end is None else normalize_time(end)
@@ -188,7 +259,8 @@ class TemporalMemoryMachine(RuleBasedStateMachine):
         if fact is not None:
             assert (fact.entity, fact.attribute, fact.value, fact.valid_from, fact.valid_to,
                     fact.recorded_at, fact.supersedes, fact.deleted) == (
-                entity, attribute, value, valid_from, valid_to, normalize_time(recorded), None, False)
+                entity, attribute, value, valid_from, valid_to, normalize_time(recorded), None,
+                False)
             self.model.records[fact.id] = fact
             self.created.append(fact.id)
 
@@ -220,19 +292,8 @@ class TemporalMemoryMachine(RuleBasedStateMachine):
 
     @rule(as_of=st.sampled_from(QUERY_TIMES), known=st.sampled_from(DAYS))
     def snapshot_matches_model(self, as_of: str, known: str) -> None:
-        moment, cutoff = normalize_time(as_of), normalize_time(known)
-        actual = {(fact.entity, fact.attribute): Expected(fact.id, fact.value, fact.valid_to)
-                  for fact in self.store.snapshot(as_of=as_of, known_at=known)}
-        assert len(actual) == len(self.store.snapshot(as_of=as_of, known_at=known)), \
-            "a snapshot holds at most one value per entity/attribute"
-        expected = {}
-        for entity in ENTITIES:
-            for attribute in ATTRIBUTES:
-                answer = self.model.answer(entity, attribute, moment, cutoff)
-                if answer is not None:
-                    expected[(entity, attribute)] = answer
-        assert actual == expected
-        event("snapshot answers: {}".format(min(len(expected), 3)))
+        answers = self._check_snapshot(as_of, known)
+        event("snapshot answers: {}".format(min(answers, 3)))
 
     @rule(entity=st.sampled_from(ENTITIES), known=st.sampled_from(DAYS),
           only=st.one_of(st.none(), st.sampled_from(ATTRIBUTES)))
@@ -249,6 +310,21 @@ class TemporalMemoryMachine(RuleBasedStateMachine):
             for fact, following in zip(timeline, timeline[1:]):
                 assert fact.valid_to is not None and fact.valid_to <= following.valid_from
 
+    @rule(entity=st.sampled_from(ENTITIES), attribute=st.sampled_from(ATTRIBUTES))
+    def audit_trail_lists_every_revision_after_the_one_it_replaces(self, entity: str,
+                                                                    attribute: str) -> None:
+        trail = self.store.audit_trail(entity, attribute)
+        assert sorted(fact.id for fact in trail) == sorted(
+            fact.id for fact in self.model.records.values()
+            if (fact.entity, fact.attribute) == (entity, attribute))
+        assert all(fact == self.model.records[fact.id] for fact in trail)
+        recorded = [fact.recorded_at for fact in trail]
+        assert recorded == sorted(recorded)
+        # Same-day revisions share a timestamp with their target; order must still hold.
+        position = {fact.id: index for index, fact in enumerate(trail)}
+        assert all(position[fact.supersedes] < position[fact.id]
+                   for fact in trail if fact.supersedes is not None)
+
     @rule(words=st.lists(st.sampled_from(SEARCH_WORDS), min_size=1, max_size=3),
           as_of=st.sampled_from(QUERY_TIMES), known=st.sampled_from(DAYS),
           mode=st.sampled_from(HybridRetriever.available_modes),
@@ -263,11 +339,17 @@ class TemporalMemoryMachine(RuleBasedStateMachine):
         assert [hit.score for hit in results] == sorted((hit.score for hit in results),
                                                         reverse=True)
         assert len({hit.fact.id for hit in results}) == len(results)
+        event("search results: {}".format("some" if results else "none"))
         for hit in results:
             assert hit.fact == eligible[hit.fact.id]
             assert entity is None or hit.fact.entity == entity
             assert hit.citation == self.store.path_for(hit.fact.id).relative_to(
                 self.store.root).as_posix()
+
+    @invariant()
+    def fixed_snapshots_match_model(self) -> None:
+        for as_of, known in CHECKED_EVERY_STEP:
+            self._check_snapshot(as_of, known)
 
     @invariant()
     def every_record_is_one_markdown_file(self) -> None:

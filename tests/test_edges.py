@@ -9,10 +9,11 @@ import types
 import pytest
 
 from temporal_memory_os import cli
-from temporal_memory_os.embeddings import HashingEmbedder, SentenceTransformerEmbedder
+from temporal_memory_os.embeddings import (EmbeddingUnavailableError, HashingEmbedder,
+                                           SentenceTransformerEmbedder)
 from temporal_memory_os.models import Fact, normalize_time, validate_topic
 from temporal_memory_os.retrieval import HybridRetriever
-from temporal_memory_os.store import MemoryConflictError, MemoryStore
+from temporal_memory_os.store import MemoryConflictError, MemoryStore, StoreIntegrityError
 
 
 @pytest.fixture
@@ -44,8 +45,8 @@ VALID = dict(id="a" * 32, entity="person", attribute="drink", value="tea",
     (dict(value=""), "value"),
     (dict(evidence=None), "evidence"),
     (dict(valid_from=None), "required"),
-    (dict(valid_from="yesterday"), "ISO"),
-    (dict(valid_from="2025-13-01"), "Invalid ISO"),
+    (dict(valid_from="yesterday"), "YYYY-MM-DD"),
+    (dict(valid_from="2025-13-01"), "month must be in"),
     (dict(valid_from=20250101), "ISO string"),
     (dict(valid_to="2025-01-01"), "later than"),
     (dict(valid_to="2024-12-31"), "later than"),
@@ -53,8 +54,14 @@ VALID = dict(id="a" * 32, entity="person", attribute="drink", value="tea",
     (dict(confidence=math.nan), "confidence"),
     (dict(confidence=1.5), "confidence"),
     (dict(confidence="high"), "confidence"),
+    (dict(confidence=10 ** 400), "confidence"),  # Not an OverflowError.
     (dict(tags="tag"), "tags"),
+    (dict(tags={"tag"}), "tags must be a list"),
     (dict(links=["ok", ""]), "links"),
+    (dict(entity="per\ud800son"), "not valid Unicode"),
+    (dict(value="\udfff"), "not valid Unicode"),
+    (dict(source="chat\ud800"), "not valid Unicode"),
+    (dict(links=["Acme", "\ud83d"]), "not valid Unicode"),
     (dict(topic="../outside"), "topic"),
     (dict(topic="a" * 600), "topic"),
     (dict(supersedes="a" * 32), "itself"),
@@ -76,7 +83,8 @@ def test_fact_from_dict_rejects_malformed_payloads():
 
 def test_fact_defaults_normalize_and_deduplicate():
     fact = Fact(**VALID, tags=["x", "x", "y"], confidence=1)
-    assert fact.tags == ["x", "y"]
+    assert fact.tags == ("x", "y")  # Immutable: records are shared by the cache.
+    assert fact.to_dict()["tags"] == ["x", "y"]
     assert isinstance(fact.confidence, float)
     assert fact.valid_from == "2025-01-01T00:00:00.000000Z"
     assert normalize_time("2025-01-01T08:00:00+08:00") == fact.valid_from
@@ -93,21 +101,38 @@ def chain(store):
     return first, second, other
 
 
-@pytest.mark.parametrize("edit, message", [
-    (lambda first, second, other: (second.id, dict(supersedes="f" * 32)), "Missing superseded"),
-    (lambda first, second, other: (second.id, dict(valid_from="2025-02-01")), "retain"),
-    (lambda first, second, other: (second.id, dict(recorded_at="2024-12-01")), "recorded before"),
+@pytest.mark.parametrize("edit, message, named", [
+    (lambda first, second, other: (second.id, dict(supersedes="f" * 32)),
+     "Missing superseded record: " + "f" * 32, ["second"]),
+    (lambda first, second, other: (second.id, dict(valid_from="2025-02-01")), "retain",
+     ["second", "first"]),
+    (lambda first, second, other: (second.id, dict(recorded_at="2024-12-01")),
+     "recorded before", ["second", "first"]),
     (lambda first, second, other: (other.id, dict(attribute="drink", supersedes=first.id,
-                                                  recorded_at="2025-01-03")), "Two corrections"),
-    (lambda first, second, other: (other.id, dict(attribute="drink")), "Duplicate effective"),
-    (lambda first, second, other: (other.id, dict(id=first.id)), "Duplicate memory id"),
-])
-def test_damaged_histories_fail_the_rebuild_and_keep_the_old_index(store, chain, edit, message):
+                                                  recorded_at="2025-01-03")),
+     "Two corrections supersede the same record: ", ["second", "other"]),
+    (lambda first, second, other: (other.id, dict(attribute="drink")), "Duplicate effective",
+     ["second", "other"]),
+    # Only one of the two files sharing the ID is named (either may be).
+    (lambda first, second, other: (other.id, dict(id=first.id)), "Duplicate memory id",
+     ["first|other"]),
+], ids=["missing", "retain", "recorded-before", "two-corrections", "duplicate-time",
+        "duplicate-id"])
+def test_damaged_histories_fail_the_rebuild_and_keep_the_old_index(store, chain, edit, message,
+                                                                   named):
+    records = dict(zip(("first", "second", "other"), chain))
     target, changes = edit(*chain)
+    files = {name: store.path_for(fact.id).relative_to(store.root).as_posix()
+             for name, fact in records.items()}
     before = store.all_facts()
     rewrite(store, target, **changes)
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(StoreIntegrityError, match=message) as caught:
         store.reindex()
+    # Errors that span records name every file involved, relative to the store.
+    text = str(caught.value)
+    assert text.endswith(")") and str(store.root) not in text
+    for names in named:
+        assert any(files[name] in text for name in names.split("|")), (names, text)
     assert store.all_facts() == before
 
 
@@ -115,8 +140,9 @@ def test_cyclic_corrections_are_rejected(store):
     first = store.add("person", "drink", "tea", valid_from="2025-01-01", recorded_at="2025-01-01")
     second = store.correct(first.id, "green tea", recorded_at="2025-01-01")
     rewrite(store, first.id, supersedes=second.id)
-    with pytest.raises(ValueError, match="Cycle"):
+    with pytest.raises(StoreIntegrityError, match="Cycle in memory correction history") as caught:
         store.reindex()
+    assert str(caught.value).endswith(".md)")
 
 
 def test_symlinked_record_and_index_are_rejected(tmp_path):
@@ -140,10 +166,10 @@ def test_failed_index_update_removes_the_new_file(store, monkeypatch):
     def broken(*_args):
         raise RuntimeError("disk full")
 
-    monkeypatch.setattr(store, "_index_record", broken)
-    with pytest.raises(RuntimeError, match="disk full"):
-        store.add("person", "drink", "tea", valid_from="2025-01-01")
-    monkeypatch.undo()
+    with monkeypatch.context() as patch:  # Undoing everything would drop conftest's isolation.
+        patch.setattr(store, "_index_record", broken)
+        with pytest.raises(RuntimeError, match="disk full"):
+            store.add("person", "drink", "tea", valid_from="2025-01-01")
     assert [path.stem for path in store.memory_dir.rglob("*.md")] == [kept.id]
     assert store.refresh() is False  # The signature still matches: nothing leaked.
     assert store.add("person", "drink", "tea", valid_from="2025-01-01").value == "tea"
@@ -187,7 +213,7 @@ def test_sentence_transformer_wrapper_loads_lazily_and_normalizes(monkeypatch):
 
 def test_sentence_transformer_wrapper_explains_missing_dependency(monkeypatch):
     monkeypatch.setitem(sys.modules, "sentence_transformers", None)
-    with pytest.raises(RuntimeError, match=r"temporal-memory-os\[semantic\]"):
+    with pytest.raises(EmbeddingUnavailableError, match=r"pip install -e .\.\[semantic\]"):
         SentenceTransformerEmbedder("any").embed(["text"])
     with pytest.raises(ValueError):
         SentenceTransformerEmbedder("")
@@ -199,6 +225,9 @@ def test_sentence_transformer_wrapper_explains_missing_dependency(monkeypatch):
     ([[1.0, 0.0], [math.inf, 0.0]], "finite"),
     ([[1.0, 0.0], [1.0, 0.0, 0.0]], "dimensions"),
     ([[1.0, 0.0]], "wrong number"),
+    # Finite values whose norm overflows once made every score a perfect 1.0.
+    ([[1.0, 0.0], [1e200, 1e200]], "too large to compare"),
+    ([[1e300, 1e300], [1.0, 0.0]], "too large to compare"),
 ])
 def test_misbehaving_embedding_providers_are_reported(store, vectors, message):
     store.add("person", "drink", "tea", valid_from="2025-01-01")

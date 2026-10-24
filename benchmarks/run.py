@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import re
 import statistics
 import sys
@@ -10,6 +11,7 @@ import tempfile
 import time
 from collections import Counter
 from datetime import datetime, timezone
+from fractions import Fraction
 from pathlib import Path
 
 # Also supports running from an uninstalled checkout.
@@ -71,10 +73,12 @@ def build_workload(store, entities):
 
 
 def build_corrections(store, entities):
-    """A status is recorded, then corrected weeks later at the same effective date.
+    """A status effective 2025-01-01 is recorded, then corrected on 2025-02-10
+    with the same effective date.
 
-    Each entity yields one question asked with the knowledge available before
-    the correction and one asked after it. Both concern the same effective day.
+    Each entity yields two questions about its state on 2025-01-15, two weeks
+    after the effective date: one asked with the knowledge available before the
+    correction (2025-01-20) and one asked after it (2025-03-01).
     """
     questions = []
     for index in range(entities):
@@ -104,6 +108,18 @@ def build_corrections(store, entities):
     return questions
 
 
+def nearest_rank(values, percent):
+    """Return the nearest-rank percentile of ``values``: the smallest value with at
+    least ``percent`` per cent of the values at or below it (the 95th of 100 for 95)."""
+    if not values:
+        raise ValueError("nearest_rank needs at least one value")
+    if not 0 < percent <= 100:
+        raise ValueError("percent must be above 0 and at most 100")
+    ordered = sorted(values)
+    rank = max(1, math.ceil(percent * len(ordered) / 100))
+    return ordered[rank - 1]
+
+
 def evaluate(questions, lookup):
     correct, stale, covered = 0, 0, 0
     latencies = []
@@ -130,7 +146,6 @@ def evaluate(questions, lookup):
                 "retrieved": None if answer is None else answer.value,
             })
     count = len(questions)
-    sorted_latency = sorted(latencies)
     return {
         "queries": count,
         "correct": correct,
@@ -138,7 +153,7 @@ def evaluate(questions, lookup):
         "stale_hit_rate": stale / count,
         "retrieval_coverage": covered / count,
         "latency_ms_median": round(statistics.median(latencies), 3),
-        "latency_ms_p95": round(sorted_latency[min(count - 1, int(count * 0.95))], 3),
+        "latency_ms_p95": round(nearest_rank(latencies, 95), 3),
         "example_errors": errors,
     }
 
@@ -171,8 +186,9 @@ WORKLOADS = {
     "late_corrections": {
         "build": build_corrections,
         "latest": ("2025-01-15", "2025-03-01"),
-        "description": "One status per entity, corrected later at the same effective date; "
-                       "the same day is queried with knowledge from before and after the correction.",
+        "description": "One status per entity, effective 2025-01-01 and corrected weeks later "
+                       "with the same effective date; the state on 2025-01-15, two weeks after "
+                       "that date, is queried with knowledge from before and after the correction.",
     },
 }
 
@@ -208,7 +224,8 @@ def run(entities=50):
             "top1_fact_accuracy": "Fraction retrieving the expected version's exact fact ID.",
             "stale_hit_rate": "Fraction returning the correct entity/attribute but the wrong version; includes future-state and future-knowledge leakage.",
             "retrieval_coverage": "Fraction with at least one returned result.",
-            "latency": "Warm-process retrieval only; excludes corpus construction and indexing.",
+            "latency": "Warm-process retrieval only (one retriever answers every query); excludes "
+                       "corpus construction and indexing. p95 uses the nearest-rank method.",
         },
         "limitations": [
             "Synthetic exact-entity queries; not a language-model answer-quality benchmark.",
@@ -222,11 +239,55 @@ def run(entities=50):
     }
 
 
-def main():
+# Top-1 accuracy that each method reaches by construction, for any number of
+# entities. The keyword baselines always return the entity's newest record (or
+# its latest state), and without a knowledge cutoff the ablation always sees the
+# correction, so these shares change only if the workload or the engine changes.
+EXPECTED_ACCURACY = {
+    "state_changes": {
+        "all_records_keyword": Fraction(1, 3), "latest_state_keyword": Fraction(1, 3),
+        "valid_time_only": Fraction(1), "temporal_hybrid": Fraction(1),
+    },
+    "late_corrections": {
+        "all_records_keyword": Fraction(1, 2), "latest_state_keyword": Fraction(1, 2),
+        "valid_time_only": Fraction(1, 2), "temporal_hybrid": Fraction(1),
+    },
+}
+
+
+def check(report):
+    """Return a list of problems: any query the full temporal search misses, or a
+    method whose accuracy differs from the value expected by construction."""
+    problems = []
+    for workload, expected in EXPECTED_ACCURACY.items():
+        methods = report["results"].get(workload, {})
+        for method, share in expected.items():
+            result = methods.get(method)
+            if result is None:
+                problems.append("{}: no result for {}".format(workload, method))
+                continue
+            if Fraction(result["correct"], result["queries"]) != share:
+                problems.append("{}: {} answered {} of {} queries correctly; expected {}".format(
+                    workload, method, result["correct"], result["queries"],
+                    share * result["queries"]))
+        temporal = methods.get("temporal_hybrid")
+        if temporal is not None and (temporal["stale_hit_rate"] != 0
+                                     or temporal["retrieval_coverage"] != 1):
+            problems.append("{}: temporal_hybrid stale-hit rate {} and coverage {}; expected 0 "
+                            "and 1".format(workload, temporal["stale_hit_rate"],
+                                           temporal["retrieval_coverage"]))
+    return problems
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--entities", type=int, default=50)
     parser.add_argument("--output", type=Path, help="Optional path for the JSON report.")
-    args = parser.parse_args()
+    parser.add_argument("--check", action="store_true",
+                        help="Exit with status 1 unless every method's top-1 accuracy equals "
+                             "the share it reaches by construction and temporal_hybrid has a "
+                             "stale-hit rate of 0 and a coverage of 1 in both workloads.")
+    args = parser.parse_args(argv)
     if not 1 <= args.entities <= 10000:
         parser.error("--entities must be between 1 and 10000")
     report = run(args.entities)
@@ -235,6 +296,13 @@ def main():
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(rendered, encoding="utf-8")
     print(rendered, end="")
+    if args.check:
+        problems = check(report)
+        for problem in problems:
+            print("Benchmark check failed: " + problem, file=sys.stderr)
+        if problems:
+            sys.exit(1)
+        print("Benchmark check passed.", file=sys.stderr)
 
 
 if __name__ == "__main__":

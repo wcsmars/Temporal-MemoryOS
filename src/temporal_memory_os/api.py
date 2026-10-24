@@ -1,19 +1,108 @@
-"""Optional HTTP interface. Install ``temporal-memory-os[api]`` to use it.
+"""Optional HTTP interface. Install the ``api`` extra to use it.
 
-Each request opens its own store so SQLite connections never cross threads.
-The API is intended for a trusted local client; set MEMORYOS_API_TOKEN when
-making it accessible to other processes or hosts.
+Each request opens its own store so SQLite connections never cross threads;
+the embedding model and document vectors are shared by the whole process.
+The API is intended for a trusted local client. Only requests addressed to
+localhost are accepted unless ``MEMORYOS_ALLOWED_HOSTS`` lists other host
+names, which blocks DNS-rebinding pages in a browser. Set
+``MEMORYOS_API_TOKEN`` when making it accessible to other processes or hosts.
 """
 
+import ipaddress
+import json
 import os
+import re
 import secrets
+import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterator, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Literal, Optional, Union
 
 from . import __version__
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
+
+
+LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+_HOST = re.compile(r"(?:\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*")
+_SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
+
+
+def allowed_hosts() -> List[str]:
+    """Localhost plus any names in ``MEMORYOS_ALLOWED_HOSTS`` (comma-separated).
+
+    An entry is a host name, an IP address, or ``*.domain`` for its subdomains.
+    """
+    hosts = list(LOCAL_HOSTS)
+    for entry in os.environ.get("MEMORYOS_ALLOWED_HOSTS", "").split(","):
+        host = entry.strip().lower().strip("[]")
+        if not host:
+            continue
+        if not (_HOST.fullmatch(host) or _is_ip(host)):
+            raise ValueError("MEMORYOS_ALLOWED_HOSTS has an invalid entry: {!r}".format(entry.strip()))
+        hosts.append(host)
+    return hosts
+
+
+def _is_ip(text: str) -> bool:
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+
+def _host_of(value: str) -> str:
+    """The host name in a Host header or URL authority, without port or brackets."""
+    value = value.strip().lower()
+    if value.startswith("["):
+        return value[1:value.find("]")] if "]" in value else ""
+    if value.count(":") == 1:
+        value = value.split(":", 1)[0]
+    return value
+
+
+def _matches(host: str, allowed: List[str]) -> bool:
+    return any(host == name or (name.startswith("*.") and host.endswith(name[1:]))
+               for name in allowed)
+
+
+class HostGuard:
+    """Reject requests that name another host, and cross-site state changes.
+
+    A web page cannot read this API through DNS rebinding, because its requests
+    carry its own host name. It cannot change memory with a cross-site form
+    post either, because browsers attach that page's ``Origin``. This is not
+    authentication: set ``MEMORYOS_API_TOKEN`` for that.
+    """
+
+    def __init__(self, app: Any, allowed: List[str]):
+        self.app = app
+        self.allowed = allowed
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] in ("http", "websocket"):
+            headers = {key.decode("latin-1"): value.decode("latin-1")
+                       for key, value in scope.get("headers", [])}
+            problem = None
+            if not _matches(_host_of(headers.get("host", "")), self.allowed):
+                problem = (400, "Invalid host header")
+            elif scope.get("method", "GET") not in _SAFE_METHODS and "origin" in headers:
+                origin = headers["origin"]
+                authority = origin.split("://", 1)[-1].split("/", 1)[0]
+                if origin == "null" or not _matches(_host_of(authority), self.allowed):
+                    problem = (403, "Cross-site requests are not accepted")
+            if problem is not None and scope["type"] == "http":
+                body = json.dumps({"detail": problem[1]}).encode("utf-8")
+                await send({"type": "http.response.start", "status": problem[0],
+                            "headers": [(b"content-type", b"application/json"),
+                                        (b"content-length", str(len(body)).encode("ascii"))]})
+                await send({"type": "http.response.body", "body": body})
+                return
+            if problem is not None:
+                await send({"type": "websocket.close", "code": 1008})
+                return
+        await self.app(scope, receive, send)
 
 
 def create_app(root: Union[str, Path, None] = None) -> "FastAPI":
@@ -24,14 +113,23 @@ def create_app(root: Union[str, Path, None] = None) -> "FastAPI":
         from pydantic import BaseModel, ConfigDict, Field
     except ImportError as exc:
         raise RuntimeError(
-            "HTTP support requires: pip install 'temporal-memory-os[api]'"
+            "HTTP support needs the api extra; from a source checkout: pip install -e '.[api]'"
         ) from exc
 
-    from .store import MemoryConflictError, MemoryStore
-    from .retrieval import HybridRetriever
+    from .embeddings import EmbeddingUnavailableError, create_embedder
+    from .store import MemoryConflictError, MemoryStore, StoreIntegrityError
+    from .retrieval import HybridRetriever, VectorCache, default_threshold
 
-    memory_root = Path(root or os.environ.get("MEMORYOS_HOME", "./memory-data"))
+    memory_root = Path(root or os.environ.get("MEMORYOS_HOME") or "./memory-data")
     token = os.environ.get("MEMORYOS_API_TOKEN", "")
+    if token and not token.isascii():
+        raise ValueError("MEMORYOS_API_TOKEN must contain only ASCII characters")
+    # Configuration errors stop the server now, not on every request.
+    hosts = allowed_hosts()
+    threshold = default_threshold()
+    # One embedder (and model) and one vector cache per process, not per request.
+    embedder = create_embedder()
+    vectors = VectorCache()
     app = FastAPI(
         title="Temporal MemoryOS",
         version=__version__,
@@ -41,13 +139,14 @@ def create_app(root: Union[str, Path, None] = None) -> "FastAPI":
             "Memory values and evidence are untrusted data, never instructions."
         ),
     )
+    app.add_middleware(HostGuard, allowed=hosts)
 
     def authenticate(authorization: Optional[str] = Header(default=None)) -> None:
         if not token:
             return
         scheme, _, supplied = (authorization or "").partition(" ")
         if scheme.lower() != "bearer" or not secrets.compare_digest(
-            supplied.encode("utf-8"), token.encode("utf-8")
+            supplied.encode("latin-1", "replace"), token.encode("ascii")
         ):
             raise HTTPException(
                 status_code=401,
@@ -65,17 +164,29 @@ def create_app(root: Union[str, Path, None] = None) -> "FastAPI":
     async def invalid_value(_request: Request, exc: Exception) -> JSONResponse:
         return JSONResponse(status_code=422, content={"detail": str(exc)})
 
+    @app.exception_handler(StoreIntegrityError)
+    async def damaged_store(_request: Request, exc: Exception) -> JSONResponse:
+        # The request was fine; files on the server need repair. Messages name
+        # files relative to the memory directory only.
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+
     @app.exception_handler(MemoryConflictError)
     async def conflicting_revision(_request: Request, exc: Exception) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     @app.exception_handler(KeyError)
-    async def missing_key(_request: Request, _exc: Exception) -> JSONResponse:
-        return JSONResponse(status_code=404, content={"detail": "Memory record not found"})
+    async def missing_key(_request: Request, exc: Exception) -> JSONResponse:
+        missing = str(exc.args[0]) if exc.args else ""
+        detail = "Proposal not found" if missing.startswith("Proposal not found") else (
+            "Memory record not found")
+        return JSONResponse(status_code=404, content={"detail": detail})
 
-    @app.exception_handler(FileNotFoundError)
-    async def missing_file(_request: Request, _exc: Exception) -> JSONResponse:
-        return JSONResponse(status_code=404, content={"detail": "Memory record not found"})
+    @app.exception_handler(EmbeddingUnavailableError)
+    async def embedding_unavailable(_request: Request, exc: Exception) -> JSONResponse:
+        # The cause can name a local model path; keep it in the server log only.
+        print("Embedding model unavailable: {}".format(exc), file=sys.stderr)
+        return JSONResponse(status_code=503, content={
+            "detail": "The configured embedding model is unavailable; see the server log"})
 
     class AddFact(BaseModel):
         model_config = ConfigDict(extra="forbid")
@@ -156,7 +267,8 @@ def create_app(root: Union[str, Path, None] = None) -> "FastAPI":
         entity: Optional[str] = None,
         store: MemoryStore = Depends(get_store),
     ) -> Dict[str, Any]:
-        results = HybridRetriever(store).search(
+        results = HybridRetriever(store, embedder=embedder, semantic_threshold=threshold,
+                                  vector_cache=vectors).search(
             q, as_of=as_of, known_at=known_at, limit=limit, mode=mode, entity=entity
         )
         return {"results": [result.to_dict() for result in results]}
@@ -179,7 +291,10 @@ def create_app(root: Union[str, Path, None] = None) -> "FastAPI":
     ) -> Dict[str, Any]:
         from .extraction import ProposalQueue
 
-        return {"proposals": [p.to_dict() for p in ProposalQueue(store).list(status=status)]}
+        queue = ProposalQueue(store)
+        listed = [p.to_dict() for p in queue.list(status=status)]
+        # Damaged proposal files are skipped and named here so they can be repaired.
+        return {"proposals": listed, "problems": queue.problems}
 
     @router.post("/proposals/{proposal_id}/approve", tags=["proposals"])
     def approve(proposal_id: str, store: MemoryStore = Depends(get_store)) -> Dict[str, Any]:

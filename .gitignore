@@ -6,6 +6,9 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
 build/
 dist/
 
@@ -13,6 +16,8 @@ dist/
 memory-data/
 .memoryos/
 *.sqlite3*
+*.sqlite
+*.db
 benchmark-results*.json
 
 # Test and analysis tooling output
@@ -21,29 +26,70 @@ benchmark-results*.json
 coverage.xml
 htmlcov/
 mutants/
-.mypy_cache/
+*.log
+*.jsonl
 
 # Secrets and private data
 .env
 .env.*
+.envrc
 config.yaml
 config.yml
 credentials/
 private/
 data/raw/
+/secrets.*
 *.key
 *.pem
 *.p12
 *.pfx
 
+# Archives, disk images and editor backups
+*.zip
+*.tar
+*.gz
+*.tgz
+*.dmg
+*.bak
+*.swp
+*.swo
+
 # Manuscripts, slides and their sources stay out of this repository
 paper/
 papers/
+thes[ei]s/
+/manuscript*
+manuscript/
+manuscripts/
+literature/
+literature*.md
+slide/
 slides/
+deck/
+decks/
+/presentation*
+presentation/
+presentations/
+talks/
 *.tex
 *.bib
+*.bbl
+*.dvi
+*.doc
 *.docx
+*.odt
+*.rtf
+*.pages
 *.pdf
+*.ppt
 *.pptx
+*.odp
+
+# Editor settings stay local
+.vscode/
+.idea/
+
+# Release tooling stays in the private working folder
+.public-maintenance/
 
 .DS_Store

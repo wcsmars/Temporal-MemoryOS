@@ -1,8 +1,9 @@
 """Embedding providers with a dependency-free, explicitly lexical default.
 
 The hashing provider is useful for offline demos and reproducible tests. It is
-not a pretrained semantic model. Install the ``semantic`` extra and explicitly
-select SentenceTransformerEmbedder to use learned semantic embeddings.
+not a pretrained semantic model. Install the ``semantic`` extra and select
+SentenceTransformerEmbedder (directly, or with ``MEMORYOS_EMBEDDING_MODEL``)
+to use learned semantic embeddings.
 """
 
 from __future__ import annotations
@@ -11,10 +12,20 @@ import hashlib
 import math
 import os
 import re
+import threading
+import unicodedata
 from typing import Any, List, Optional, Protocol, Sequence
 
 
 _TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
+# Dropped from queries (not from documents) so that question words do not make
+# every fact look relevant. A query made only of these words keeps them.
+STOPWORDS = frozenset("""
+a about an and are as at be been but by can could did do does for from had has have he her
+hers him his how i if in into is it its just me my of on or our she so that the their them
+then there these they this to was we were what when where which who whom why will with
+would you your
+""".split())
 # Deliberately small and inspectable. This is query normalization, not an LLM.
 _ALIASES = {
     "applications": "application", "applied": "application",
@@ -28,12 +39,43 @@ _ALIASES = {
 
 
 def tokenize(text: str) -> List[str]:
-    """Casefolded Unicode words; punctuation never becomes query syntax."""
-    return _TOKEN.findall(text.casefold())
+    """Casefolded Unicode words; punctuation never becomes query syntax.
+
+    Text is NFKC-normalized and casefolded first, so composed and decomposed
+    accents, ligatures and case expansions (such as German sharp s) compare
+    equal. Combining marks continue a word, which keeps scripts such as
+    Devanagari intact.
+    """
+    folded = unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", text).casefold())
+    if folded.isascii():
+        return _TOKEN.findall(folded)
+    tokens: List[str] = []
+    current: List[str] = []
+    for character in folded:
+        if (character.isalnum() and character != "_") or (
+                current and unicodedata.category(character).startswith("M")):
+            current.append(character)
+        elif current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+    return tokens
 
 
 def normalized_tokens(text: str) -> List[str]:
     return [_ALIASES.get(token, token) for token in tokenize(text)]
+
+
+def query_terms(text: str) -> List[str]:
+    """Normalized query tokens without stopwords, unless nothing else is left."""
+    tokens = normalized_tokens(text)
+    content = [token for token in tokens if token not in STOPWORDS]
+    return content or tokens
+
+
+class EmbeddingUnavailableError(RuntimeError):
+    """The configured embedding model could not be loaded or run."""
 
 
 class Embedder(Protocol):
@@ -52,13 +94,14 @@ class HashingEmbedder:
     Small spelling/inflection aliases are listed in this module.
     """
 
-    name = "lexical-hash-v1"
     semantic = False
 
     def __init__(self, dimensions: int = 384):
         if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions < 32:
             raise ValueError("dimensions must be an integer of at least 32")
         self.dimensions = dimensions
+        # Part of the vector cache key, so it must change with the vector size.
+        self.name = "lexical-hash-v1-{}".format(dimensions)
 
     def embed(self, texts: Sequence[str]) -> List[List[float]]:
         result = []
@@ -76,8 +119,12 @@ class HashingEmbedder:
 class SentenceTransformerEmbedder:
     """Optional real semantic embeddings; first use may download model weights.
 
-    Models must support ``SentenceTransformer.encode``. No remote code is
-    trusted. Supply a local model directory for an entirely offline deployment.
+    Models must support ``SentenceTransformer.encode``. Code hosted with a model
+    on the Hub is never executed (``trust_remote_code=False``), but a local
+    model directory is loaded like a Python package and should be trusted
+    like code. A model already in the local cache is loaded without network
+    access; otherwise it is downloaded. The model is loaded once per embedder
+    object and reused.
     """
 
     semantic = True
@@ -85,26 +132,53 @@ class SentenceTransformerEmbedder:
     def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
         if not model_name or not isinstance(model_name, str):
             raise ValueError("model_name must be a non-empty string")
-        self.model_name = model_name
+        self.model_name = os.path.expanduser(model_name) if model_name.startswith("~") else model_name
         self.name = "sentence-transformers:" + model_name
         self._model: Any = None
+        self._lock = threading.Lock()
 
     def embed(self, texts: Sequence[str]) -> List[List[float]]:
         if not texts:
             return []
-        if self._model is None:
+        # One lock covers loading and encoding: server threads share this
+        # object, and model inference is not documented as thread-safe.
+        with self._lock:
+            if self._model is None:
+                self._load()
             try:
-                from sentence_transformers import SentenceTransformer
-            except ImportError as error:
-                raise RuntimeError(
-                    "Semantic embeddings require the optional dependency: "
-                    "pip install 'temporal-memory-os[semantic]'"
-                ) from error
-            self._model = SentenceTransformer(self.model_name, trust_remote_code=False)
-        vectors = self._model.encode(
-            list(texts), normalize_embeddings=True, show_progress_bar=False,
-        )
+                vectors = self._model.encode(
+                    list(texts), normalize_embeddings=True, show_progress_bar=False,
+                )
+            except Exception as error:
+                raise EmbeddingUnavailableError("The embedding model failed: {}: {}".format(
+                    type(error).__name__, error)) from error
         return [[float(value) for value in row] for row in vectors]
+
+    def _load(self) -> None:
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as error:
+            raise EmbeddingUnavailableError(
+                "Semantic embeddings need the optional dependency: from a source checkout, "
+                "pip install -e '.[semantic]'"
+            ) from error
+        except Exception as error:  # A broken torch install can fail with OSError and others.
+            raise EmbeddingUnavailableError("Could not import sentence-transformers ({}: {})".format(
+                type(error).__name__, error)) from error
+        try:
+            # A model already in the local cache loads without any network
+            # access; offline, the online attempt would retry for over a minute.
+            self._model = SentenceTransformer(self.model_name, trust_remote_code=False,
+                                              local_files_only=True)
+            return
+        except Exception:
+            pass
+        try:
+            self._model = SentenceTransformer(self.model_name, trust_remote_code=False)
+        except Exception as error:  # The library raises many unrelated types.
+            raise EmbeddingUnavailableError(
+                "Could not load the embedding model {!r} ({}: {})".format(
+                    self.model_name, type(error).__name__, error)) from error
 
 
 def create_embedder(model_name: Optional[str] = None) -> Embedder:
