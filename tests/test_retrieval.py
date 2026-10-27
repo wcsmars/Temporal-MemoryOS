@@ -321,15 +321,28 @@ def test_a_long_repetitive_query_and_many_names_with_stopwords_stay_fast(monkeyp
 
 
 def test_names_that_are_prefixes_of_each_other_stay_fast(monkeypatch):
-    """Each written-out name is collected once, even when names extend one another."""
-    facts = [Fact("%032x" % number, " ".join(["the"] * (number + 1)), "genre", "rock",
-                  valid_from="2025-01-01") for number in range(400)]
-    query = "the " * 2400
-    retriever = HybridRetriever(Facts(facts), HashingEmbedder())
-    started = time.perf_counter()
+    """Each written-out name is collected once, even when names extend one another.
+
+    Four times the names and query cost about 15 times as much (the query's length times
+    the longest name); collecting every name at every match cost about 50 times as much.
+    The growth is compared rather than the time, so a slow machine cannot fail the test.
+    """
+    def setup(count):
+        facts = [Fact("%032x" % number, " ".join(["the"] * (number + 1)), "genre", "rock",
+                      valid_from="2025-01-01") for number in range(count)]
+        return HybridRetriever(Facts(facts), HashingEmbedder()), "the " * (6 * count)
+
+    def fastest(retriever, query):
+        times = []
+        for _ in range(3):
+            started = time.perf_counter()
+            retriever.search(query, mode="keyword", limit=5)
+            times.append(time.perf_counter() - started)
+        return min(times)
+
+    retriever, query = setup(400)
+    assert fastest(retriever, query) < 30 * fastest(*setup(100))
     found = [hit.fact.id for hit in retriever.search(query, mode="keyword", limit=5)]
-    # Typically under 0.1 seconds; collecting every name at every match took about 1.6.
-    assert time.perf_counter() - started < 0.6
     monkeypatch.setattr(retrieval_module, "_named_words", names_written_out)
     assert [hit.fact.id for hit in retriever.search(query, mode="keyword", limit=5)] == found
 

@@ -4,6 +4,7 @@
 
 - On Linux with Python 3.14, which can load JSON nested more deeply than it can write back, such a proposal file is reported as a damaged file like any other; before, it stopped the whole proposal listing (and the CLI command or HTTP request that listed proposals).
 - CI runs every Python version to the end instead of cancelling the others at the first failure.
+- A speed test compares how the time grows with the input instead of a fixed time limit, which a slow CI machine exceeded.
 
 ## 0.2.3
 
