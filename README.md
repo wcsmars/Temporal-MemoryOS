@@ -287,7 +287,7 @@ Each layer catches a different kind of mistake. CI runs every layer except mutat
 
 ```sh
 python -m pip install -e '.[api,mcp,dev]'
-pytest -q --cov          # 1,069 tests, coverage report and 90% floor
+pytest -q --cov          # 1,070 tests, coverage report and 90% floor
 ruff check .
 mypy
 python benchmarks/run.py --entities 50 --check --output benchmark-results.json

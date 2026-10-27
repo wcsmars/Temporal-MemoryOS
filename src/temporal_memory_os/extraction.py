@@ -218,15 +218,19 @@ class ProposalQueue:
         except OSError as exc:  # Unreadable, or a folder with a proposal's name.
             raise StoreIntegrityError("{} cannot be read ({}); fix or delete it".format(
                 name, _reason(exc))) from exc
+        known = {item.name for item in fields(Proposal)}
+        if not isinstance(data, dict) or not known.issuperset(data):
+            raise ValueError("{} is not a proposal file; fix or delete it".format(name))
         try:
             # JSON can escape a lone surrogate ("\ud800"), which no output can encode.
             json.dumps(data, ensure_ascii=False).encode("utf-8")
         except UnicodeEncodeError as exc:
             raise ValueError("{} contains text that is not valid Unicode; fix or delete "
                              "it".format(name)) from exc
-        known = {item.name for item in fields(Proposal)}
-        if not isinstance(data, dict) or not known.issuperset(data):
-            raise ValueError("{} is not a proposal file; fix or delete it".format(name))
+        except RecursionError as exc:
+            # Where the stack allows deeper loading than writing (Linux, Python 3.14),
+            # a deeply nested field loads but cannot be written back.
+            raise ValueError("{} is not a proposal file; fix or delete it".format(name)) from exc
         try:
             proposal = Proposal(**data)
         except TypeError as exc:

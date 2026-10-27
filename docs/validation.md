@@ -1,5 +1,7 @@
 # Local validation record
 
+Version 0.2.4 (27 October 2026) changes only how a proposal file is checked when it is read, so that Python 3.14 on Linux reports a proposal file nested too deeply to write back instead of failing the whole listing (see the changelog). Its 1,070 tests pass on macOS with Python 3.10, 3.11, 3.13 and 3.14 (1,069 run there; the non-UTF-8 file-name test needs Linux), with 98.6% branch coverage, and `ruff` and `mypy` pass. The rest of this record was measured on 0.2.3; the benchmarks do not run the changed code.
+
 Validated on 27 October 2026 for version 0.2.3, using Python 3.11.7 on macOS (arm64).
 
 - 1,068 of 1,069 tests passed. The other one creates a file name that is not valid UTF-8, which macOS file systems refuse, so it runs only on Linux. On Linux, the 10 tests that need a case-insensitive file system, as macOS has, are skipped instead; a run on a case-sensitive disk image on macOS skipped exactly those 10 and passed every other test. CI runs the tests on both systems, so every test runs on at least one of them. The tests cover temporal storage, retrieval, extraction, change detection, the CLI, HTTP API, MCP tools, Git checkpoints and writers in separate processes, with regression tests for every fix in the 0.2.2 and 0.2.3 changelogs, output-contract tests, tests of the benchmark scripts, and property-based tests.

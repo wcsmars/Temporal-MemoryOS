@@ -2289,6 +2289,26 @@ def test_a_deeply_nested_proposal_file_is_reported_not_raised(store):
     assert queue.approve(good.id).value == "one"
 
 
+def test_a_nested_proposal_field_that_cannot_be_written_back_is_reported(store, monkeypatch):
+    """Python 3.14 on Linux loads nesting deeper than json.dumps can write; the file is
+    reported like any other damaged proposal instead of failing the whole listing."""
+    queue = ProposalQueue(store)
+    [good] = queue.extract("Alpha | status | one | 2026-01-01", source="chat")
+    (queue.directory / ("e" * 32 + ".json")).write_text('{"warnings": [[["deep"]]]}',
+                                                       encoding="utf-8")
+    dumps = json.dumps
+
+    def shallow_writer(data, **options):
+        if isinstance(data, dict) and data.get("warnings") == [[["deep"]]]:
+            raise RecursionError("maximum recursion depth exceeded while encoding a JSON object")
+        return dumps(data, **options)
+
+    monkeypatch.setattr(json, "dumps", shallow_writer)
+    assert [proposal.id for proposal in queue.list()] == [good.id]
+    assert queue.problems == ["proposals/{}.json is not a proposal file; fix or delete it"
+                              .format("e" * 32)]
+
+
 def test_a_deeply_nested_record_is_reported_as_a_store_problem(store):
     record = hand_written_record().replace('"tea"', "[" * 100_000 + "]" * 100_000)
     (store.memory_dir / "hand.md").write_text(record, encoding="utf-8")

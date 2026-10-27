@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.4
+
+- On Linux with Python 3.14, which can load JSON nested more deeply than it can write back, such a proposal file is reported as a damaged file like any other; before, it stopped the whole proposal listing (and the CLI command or HTTP request that listed proposals).
+- CI runs every Python version to the end instead of cancelling the others at the first failure.
+
 ## 0.2.3
 
 Fixes from another full review of the code, the documentation and every step of the user guide.
