@@ -10,12 +10,14 @@ import sqlite3
 import threading
 import unicodedata
 from array import array
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Protocol, Sequence, Set, Tuple
 
-from .embeddings import STOPWORDS, Embedder, create_embedder, normalized_tokens, tokenize
+from .embeddings import (STOPWORDS, Embedder, EmbeddingUnavailableError, create_embedder,
+                         normalized_tokens, tokenize)
 from .models import Fact, TimeInput
 
 Ranking = List[Tuple[str, float]]
@@ -41,8 +43,55 @@ def _words(text: str) -> str:
 
 
 def _content(tokens: Iterable[str], keep: Set[str]) -> List[str]:
-    """Drop stopwords, except words that belong to an entity name in the snapshot."""
+    """Drop stopwords, except words of an entity name that the query writes out."""
     return [token for token in tokens if token not in STOPWORDS or token in keep]
+
+
+# The trie key that ends a whole name in _named_words. Never a word: tokens are runs of
+# letters, digits and combining marks.
+_NAME_END = ""
+
+
+def _named_words(query: str, facts: Iterable[Fact]) -> Set[str]:
+    """Words of the entity names that the query writes out as consecutive words.
+
+    Stopwords among them still count ("The Who"), but only for a query that
+    names the entity: otherwise one such name would make "the" match every fact.
+    Only names holding a stopword can change what a query keeps, so only those
+    are looked for, in a trie of their words. The cost is at most the query's
+    length times the longest such name, however often a word repeats.
+    """
+    # A node maps a word to the next node; under _NAME_END it holds the words of a name.
+    trie: Dict[str, Any] = {}
+    for entity in {fact.entity for fact in facts}:
+        name = normalized_tokens(entity)
+        if any(word in STOPWORDS or _unaccented(word) in STOPWORDS for word in name):
+            node = trie
+            for word in name:
+                node = node.setdefault(word, {})
+            node[_NAME_END] = name
+    keep: Set[str] = set()
+    if not trie:
+        return keep
+    words = normalized_tokens(query)
+    for start in range(len(words)):
+        node = trie
+        for position in range(start, len(words)):
+            following = node.get(words[position])
+            if following is None:
+                break
+            node = following
+            if _NAME_END in node:
+                keep.update(node.pop(_NAME_END))  # Each name once.
+    return keep
+
+
+def _unaccented(token: str) -> str:
+    """A token as the keyword index sees it once accents are folded ("à" is "a")."""
+    if token.isascii():
+        return token
+    return "".join(character for character in unicodedata.normalize("NFD", token)
+                   if not unicodedata.combining(character))
 
 
 class FactSource(Protocol):
@@ -57,13 +106,14 @@ class VectorCache:
     """Document vectors keyed by embedder name and the exact embedded text.
 
     Keying by text rather than fact ID means an edited record, or a different
-    model, can never reuse a stale vector. One cache can be shared by many
-    retrievers (the HTTP and MCP servers keep one per process); access is
-    guarded by a lock.
+    model, can never reuse a stale vector. Past the limit, the least recently
+    used vectors are dropped, so a store larger than the cache still has most
+    of its vectors reused. One cache can be shared by many retrievers (the
+    HTTP and MCP servers keep one per process); access is guarded by a lock.
     """
 
     def __init__(self) -> None:
-        self._entries: Dict[Tuple[str, str], VectorEntry] = {}
+        self._entries: OrderedDict[Tuple[str, str], VectorEntry] = OrderedDict()
         self._lock = threading.Lock()  # The servers share one cache across threads.
 
     def __len__(self) -> int:
@@ -71,15 +121,20 @@ class VectorCache:
 
     def get(self, key: Tuple[str, str]) -> Optional[VectorEntry]:
         with self._lock:
-            return self._entries.get(key)
+            entry = self._entries.get(key)
+            if entry is not None:
+                self._entries.move_to_end(key)
+            return entry
 
     def store(self, entries: Dict[Tuple[str, str], VectorEntry], limit: int) -> None:
         with self._lock:
-            if not entries or len(entries) > limit:
-                return  # Nothing new, or larger than the whole cache.
-            if len(self._entries) + len(entries) > limit:
-                self._entries.clear()
-            self._entries.update(entries)
+            if not entries:
+                return  # Nothing new: a smaller limit must not trim a shared cache.
+            for key, entry in entries.items():
+                self._entries[key] = entry
+                self._entries.move_to_end(key)
+            while len(self._entries) > max(limit, 0):
+                self._entries.popitem(last=False)
 
 
 @dataclass
@@ -202,15 +257,21 @@ def default_threshold() -> float:
 
 
 def _validated(vector: Sequence[float]) -> Tuple[List[float], float]:
-    values = [float(value) for value in vector]
+    """A vector's values and norm. Unusable output is the model's fault, not the
+    request's, so it is reported as an unavailable model rather than bad input."""
+    try:
+        values = [float(value) for value in vector]
+    except (TypeError, ValueError, OverflowError) as error:
+        raise EmbeddingUnavailableError(
+            "Embedding vectors must contain only finite numbers") from error
     if not all(math.isfinite(value) for value in values):
-        raise ValueError("Embedding vectors must contain only finite numbers")
+        raise EmbeddingUnavailableError("Embedding vectors must contain only finite numbers")
     try:
         norm = math.sqrt(math.fsum(value * value for value in values))
     except OverflowError:  # Finite squares whose sum is not.
         norm = math.inf
     if not math.isfinite(norm):
-        raise ValueError("Embedding vectors are too large to compare")
+        raise EmbeddingUnavailableError("Embedding vectors are too large to compare")
     return values, norm
 
 
@@ -240,13 +301,17 @@ class HybridRetriever:
     Hybrid scores use reciprocal rank fusion (k=60) over competition ranks, so
     tied raw scores contribute equally. Common English function words are
     dropped from keyword and lexical queries (see ``embeddings.STOPWORDS``)
-    unless they are part of an entity name in the snapshot; only the first 64
-    distinct keyword terms are used. Keyword matching folds accents.
+    unless the query names an entity whose name contains them; only the first
+    64 distinct keyword terms are used. Keyword matching folds accents, and so
+    does its stopword check ("à" counts as "a").
 
     ``semantic_threshold`` (default 0.25, or ``MEMORYOS_SEMANTIC_THRESHOLD``)
     applies to learned models only; different models need different values.
-    Document vectors are cached per retriever (at most ``cache_limit``);
-    pass a shared ``vector_cache`` to reuse them across retrievers.
+    Document vectors are cached per retriever (at most ``cache_limit``, least
+    recently used dropped first); pass a shared ``vector_cache`` to reuse them
+    across retrievers. A document whose vector is not finite, or too large to
+    compare, is skipped like a zero vector; such a query vector, a wrong number
+    of vectors or mismatched sizes raise ``EmbeddingUnavailableError``.
     """
 
     available_modes = ("keyword", "semantic", "graph", "hybrid")
@@ -290,9 +355,12 @@ class HybridRetriever:
             return []
 
         channels: Dict[str, Ranking] = {}
-        # Stopwords that are part of an entity name ("The Who") still count.
-        keep = {token for fact in facts for token in normalized_tokens(fact.entity)}
-        if mode in ("keyword", "hybrid") and has_words:
+        # Only keyword matching and word hashing drop stopwords; the graph channel and a
+        # learned model read the query as written.
+        keyword = mode in ("keyword", "hybrid") and has_words
+        lexical = not semantic and mode in ("semantic", "hybrid")
+        keep = _named_words(query, facts) if keyword or lexical else set()
+        if keyword:
             channels["keyword"] = self._keyword(query, facts, keep)
         if mode in ("semantic", "hybrid"):
             channels[self.embedding_channel] = self._embedding(query, facts, keep)
@@ -322,7 +390,10 @@ class HybridRetriever:
 
     @staticmethod
     def _keyword(query: str, facts: List[Fact], keep: Set[str]) -> Ranking:
-        terms = list(dict.fromkeys(_content(tokenize(query), keep)))[:MAX_KEYWORD_TERMS]
+        # The index folds accents, so "à" or "thé" would match every "a" or "the".
+        terms = list(dict.fromkeys(
+            token for token in tokenize(query)
+            if _unaccented(token) not in STOPWORDS or token in keep))[:MAX_KEYWORD_TERMS]
         if not terms:
             return []
         # MATCH receives quoted word tokens only; user operators are never SQL
@@ -368,13 +439,20 @@ class HybridRetriever:
         embedded_query = " ".join(query_tokens) if lexical else query
         vectors = self.embedder.embed([embedded_query] + [text for _, text in missing])
         if len(vectors) != len(missing) + 1:
-            raise ValueError("Embedding provider returned the wrong number of vectors")
+            raise EmbeddingUnavailableError(
+                "Embedding provider returned the wrong number of vectors")
         query_vector, query_norm = _validated(vectors[0])
         computed: Dict[Tuple[str, str], VectorEntry] = {}
         for key, vector in zip(missing, vectors[1:]):
-            values, norm = _validated(vector)
+            try:
+                values, norm = _validated(vector)
+            except EmbeddingUnavailableError:
+                # One record the model cannot embed must not stop every search.
+                # Left uncached, so a later search tries it again.
+                continue
             if len(values) != len(query_vector):
-                raise ValueError("Embedding provider returned inconsistent vector dimensions")
+                raise EmbeddingUnavailableError(
+                    "Embedding provider returned inconsistent vector dimensions")
             computed[key] = _entry(values, norm, frozenset(normalized_tokens(key[1])))
         self.vectors.store(computed, self.cache_limit)
         entries.update(computed)
@@ -382,13 +460,16 @@ class HybridRetriever:
         wanted = set(query_tokens)
         ranking: Ranking = []
         for fact, key in zip(facts, keys):
-            entry = entries[key]
+            entry = entries.get(key)
+            if entry is None:
+                continue  # Its vector was unusable.
             dimensions, _, _, norm, tokens = entry
             # Hash collisions must never produce apparently relevant results.
             if lexical and wanted.isdisjoint(tokens):
                 continue
             if dimensions != len(query_vector):
-                raise ValueError("Embedding provider returned inconsistent vector dimensions")
+                raise EmbeddingUnavailableError(
+                    "Embedding provider returned inconsistent vector dimensions")
             if not norm or not query_norm:
                 continue
             score = _dot(query_vector, entry) / (query_norm * norm)

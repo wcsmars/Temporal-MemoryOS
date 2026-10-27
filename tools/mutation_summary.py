@@ -27,6 +27,9 @@ returned or stored, and anything the rule cannot place. Run from the
 repository root after:
 
     HYPOTHESIS_PROFILE=mutation mutmut run
+
+With no results, or a run that left mutants unchecked, it prints no score
+and exits 1.
 """
 
 from __future__ import annotations
@@ -73,8 +76,18 @@ SQL_KEYWORDS = frozenset("""
 
 
 def mutmut(*arguments: str) -> str:
-    return subprocess.run([sys.executable, "-m", "mutmut", *arguments], capture_output=True,
-                          text=True, check=True).stdout
+    """Run ``python -m mutmut`` with ``arguments`` and return its output.
+
+    Exits with mutmut's own error message if it fails, for example when it is not
+    installed in this interpreter.
+    """
+    result = subprocess.run([sys.executable, "-m", "mutmut", *arguments], capture_output=True,
+                            text=True)
+    if result.returncode:
+        raise SystemExit("mutmut {} failed:\n{}\nIf mutmut is not installed here, run: "
+                         "python -m pip install -e '.[mutation]'".format(
+                             arguments[0], (result.stderr or result.stdout).strip()))
+    return result.stdout
 
 
 def _aligned(diff: str) -> Optional[Tuple[List[str], List[str]]]:
@@ -297,17 +310,37 @@ def main() -> int:
     args = parser.parse_args()
     statuses = collections.Counter()
     survivors = []
+    interrupted = []
     for line in mutmut("results", "--all", "true").splitlines():
         name, _, status = line.strip().rpartition(": ")
         if name:
             statuses[status] += 1
             if status == "survived":
                 survivors.append(name)
+            elif status == "check was interrupted by user":
+                interrupted.append(name)
     total = sum(statuses.values())
+    if not total:
+        # mutmut lists nothing, and exits 0, when no run has made mutants in this folder.
+        print("No mutmut results here. Run HYPOTHESIS_PROFILE=mutation mutmut run first.",
+              file=sys.stderr)
+        return 1
+    # After a run that stopped early, for example because the tests failed before
+    # any mutant was tried, mutmut lists the mutants it did not check and exits 0.
+    unchecked = statuses["not checked"] + len(interrupted)
+    if unchecked:
+        print("The mutmut run did not finish: {} of {} mutants were not checked, so there is "
+              "no score.\nCheck that the tests pass, then rerun: "
+              "HYPOTHESIS_PROFILE=mutation mutmut run".format(unchecked, total), file=sys.stderr)
+        if interrupted:
+            print("Interrupted mutants are checked again only when named: "
+                  "HYPOTHESIS_PROFILE=mutation mutmut run {}".format(" ".join(interrupted)),
+                  file=sys.stderr)
+        return 1
     caught = statuses["killed"] + statuses["timeout"]
     behavioral = [name for name in survivors if not text_only(mutmut("show", name))]
     print("mutants: {}  caught: {} ({:.1%})  survived: {}".format(
-        total, caught, caught / total if total else 0, len(survivors)))
+        total, caught, caught / total, len(survivors)))
     print("survivors that only change message text or SQL keyword case: {}".format(
         len(survivors) - len(behavioral)))
     print("other survivors to review: {}".format(len(behavioral)))

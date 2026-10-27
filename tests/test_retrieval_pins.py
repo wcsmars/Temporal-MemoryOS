@@ -8,7 +8,7 @@ from array import array
 
 import pytest
 
-from temporal_memory_os.embeddings import HashingEmbedder
+from temporal_memory_os.embeddings import EmbeddingUnavailableError, HashingEmbedder
 from temporal_memory_os.models import Fact
 from temporal_memory_os.retrieval import _QueryWords, HybridRetriever, VectorCache
 from temporal_memory_os.store import MemoryStore
@@ -256,7 +256,7 @@ def test_a_cached_vector_of_another_size_is_reported_as_a_dimension_mismatch(sto
     retriever = HybridRetriever(store, embedder)
     assert len(retriever.search("tea", mode="semantic")) == 1
     embedder.default = (1.0, 0.0, 0.0)
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(EmbeddingUnavailableError) as caught:
         retriever.search("tea", mode="semantic")
     assert "dimension" in str(caught.value)
 
@@ -419,3 +419,54 @@ def test_a_name_that_starts_with_an_opening_mark_is_written_out_by_itself(store)
         "¡Forward, Russia!", "Forward Russia"}
     assert graph_entities(store, "forward russia tonight") == {"Forward Russia"}
     assert graph_entities(store, "what does (+) mean") == {"(+)"}
+
+
+# ==========================================================================
+# 0.2.3 review: a zero cache limit, accented stopword names, unusable vectors
+# ==========================================================================
+
+
+def test_a_cache_limit_of_zero_keeps_no_vectors(store):
+    class Retunable:
+        """A learned-model stand-in whose document vector changes between searches."""
+
+        name = "retunable"
+        semantic = True
+
+        def __init__(self):
+            self.document = [1.0, 0.0]
+
+        def embed(self, texts):
+            return [[1.0, 0.0]] + [list(self.document) for _ in texts[1:]]
+
+    fact = store.add("person", "drink", "tea", valid_from="2025-01-01")
+    embedder = Retunable()
+    retriever = HybridRetriever(store, embedder, semantic_threshold=0.0)
+    retriever.cache_limit = 0
+    [first] = retriever.search("tea", mode="semantic")
+    assert first.fact.id == fact.id and first.channels == {"semantic": 1.0}
+    embedder.document = [0.6, 0.8]
+    [second] = retriever.search("tea", mode="semantic")
+    assert second.channels == {"semantic": 0.6}
+    assert len(retriever.vectors) == 0
+
+
+def test_a_name_made_of_an_accented_stopword_is_found_by_keyword(store):
+    fact = store.add("Thé", "kind", "drink", valid_from="2020-01-01")
+    results = HybridRetriever(store).search("thé", mode="keyword")
+    assert [result.fact.id for result in results] == [fact.id]
+
+
+def test_an_unusable_vector_does_not_hide_the_records_after_it(store):
+    class PartlyBroken:
+        semantic = True
+        name = "partly-broken"
+
+        def embed(self, texts):
+            return [[float("nan"), 0.0] if "broken" in text else [1.0, 0.0] for text in texts]
+
+    store.add("alpha", "drink", "broken tea", valid_from="2025-01-01")
+    good = store.add("beta", "drink", "tea", valid_from="2025-01-01")
+    results = HybridRetriever(store, PartlyBroken(), semantic_threshold=0.25).search(
+        "tea", mode="semantic")
+    assert [result.fact.id for result in results] == [good.id]

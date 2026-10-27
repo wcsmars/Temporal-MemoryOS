@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -107,6 +109,43 @@ def test_fetch_of_a_missing_record_names_it(tmp_path):
             assert result.isError
             [content] = result.content
             assert content.text.endswith("Memory record not found: " + missing)
+
+    asyncio.run(scenario())
+
+
+def damage_pages_holding(root, text):
+    """Overwrite the index pages that hold ``text``. The header and schema stay
+    intact, so the store opens and the damage shows only when a query reads them."""
+    index = root / ".memoryos" / "index.sqlite3"
+    with closing(sqlite3.connect(str(index))) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    raw = bytearray(index.read_bytes())
+    size = int.from_bytes(raw[16:18], "big")
+    pages = [start for start in range(size, len(raw), size)
+             if text.encode() in raw[start:start + size]]
+    assert pages
+    for start in pages:
+        raw[start:start + size] = b"\xab" * size
+    index.write_bytes(bytes(raw))
+
+
+def test_index_damage_found_by_a_query_is_reported_with_the_repair_hint(tmp_path):
+    """Damage that only a query reads gets the repair hint, not the raw database error."""
+    with MemoryStore(tmp_path) as store:
+        fact = store.add("person", "drink", "tea-marker", valid_from="2025-01-01")
+    damage_pages_holding(tmp_path, "tea-marker")
+
+    async def scenario():
+        server = create_server(tmp_path)
+        async with create_connected_server_and_client_session(server) as session:
+            for name, arguments in (("search", {"query": "tea"}), ("fetch", {"id": fact.id}),
+                                    ("memory_history", {"entity": "person"})):
+                result = await session.call_tool(name, arguments)
+                assert result.isError, name
+                [content] = result.content
+                assert "The index .memoryos/index.sqlite3 is damaged (" in content.text
+                assert "run `memoryos reindex`" in content.text
+                assert str(tmp_path) not in content.text
 
     asyncio.run(scenario())
 

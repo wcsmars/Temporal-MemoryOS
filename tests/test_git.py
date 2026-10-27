@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 from contextlib import closing
+from pathlib import Path
 
 import pytest
 
@@ -31,10 +32,11 @@ WAIT = 120  # Seconds; generous for slow CI machines. Passing runs take far less
 LOCATION_VARIABLES = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
                       "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR")
 EXCLUDE_HEADER = "# Temporal MemoryOS derived/local files"
-# Every rule git-init writes, in order. "!*.tmp/" keeps topic folders named like
-# "notes.tmp" in; the last two leave editor backups ("notes.md~", "#notes.md#") out.
-EXCLUDE_RULES = (".memoryos/", "*.sqlite3*", ".env", "proposals/.lock", "*.tmp", "!*.tmp/",
-                 "/memory/**/.*", "/proposals/.*", "/memory/**/*~", "/memory/**/#*#")
+# Every rule git-init writes, in order. "!*.sqlite3*/" and "!*.tmp/" keep topic
+# folders named like "app.sqlite3" or "notes.tmp" in; the last two leave editor
+# backups ("notes.md~", "#notes.md#") out.
+EXCLUDE_RULES = (".memoryos/", "*.sqlite3*", "!*.sqlite3*/", ".env", "proposals/.lock", "*.tmp",
+                 "!*.tmp/", "/memory/**/.*", "/proposals/.*", "/memory/**/*~", "/memory/**/#*#")
 # How the refusals tell you to mark a repository you made yourself for checkpoints.
 OPT_IN = "git -C <memory directory> config memoryos.checkpoints true"
 
@@ -522,9 +524,36 @@ def test_a_repository_made_by_0_2_1_keeps_temporary_rules_off_topic_folders(tmp_
     assert history.checkpoint("After upgrading")["committed"]
     assert tree(tmp_path) == [path]
     lines = exclude.read_text(encoding="utf-8").splitlines()
-    assert lines[:len(old)] == old  # Your rules stay as they were; missing ones are appended.
-    assert all(lines.count(rule) == 1 for rule in EXCLUDE_RULES)
-    assert lines.index("!*.tmp/") > lines.index("*.tmp")  # Git applies the last match.
+    # Lines before the block stay as they were; the block gets every rule in the documented
+    # order, since Git applies the last rule that matches.
+    assert lines[:2] == old[:2]
+    assert lines[2:] == [EXCLUDE_HEADER, *EXCLUDE_RULES]
+
+
+def test_a_repository_made_by_0_2_2_keeps_dot_and_backup_folders_out_of_checkpoints(
+        tmp_path, history):
+    """Upgraded rules keep "!*.sqlite3*/" before the dot-file and backup rules; your own stay."""
+    exclude = tmp_path / ".git" / "info" / "exclude"
+    rules_0_2_2 = [".memoryos/", "*.sqlite3*", ".env", "proposals/.lock", "*.tmp", "!*.tmp/",
+                   "/memory/**/.*", "/proposals/.*", "/memory/**/*~", "/memory/**/#*#"]
+    own = ["# A rule of your own", "local-notes/"]
+    exclude.write_text("\n".join(["# A comment from Git's template", "", EXCLUDE_HEADER,
+                                  *rules_0_2_2, *own]) + "\n", encoding="utf-8")
+    with MemoryStore(tmp_path) as store:
+        fact = store.add("Inventory db", "engine", "SQLite 3.45", valid_from="2025-01-01",
+                         topic="tools/app.sqlite3")
+        path = store.path_for(fact.id).relative_to(store.root).as_posix()
+    memory = tmp_path / "memory"
+    for folder in (".x.sqlite3", "n.sqlite3~", "#n.sqlite3#"):
+        (memory / folder).mkdir()
+        (memory / folder / "f.md").write_text("left out", encoding="utf-8")
+    (memory / ".x.sqlite3" / "f.txt").write_text("left out", encoding="utf-8")
+    assert history.checkpoint("After upgrading")["committed"]
+    assert tree(tmp_path) == [path]
+    lines = exclude.read_text(encoding="utf-8").splitlines()
+    assert lines == ["# A comment from Git's template", "", EXCLUDE_HEADER, *EXCLUDE_RULES,
+                     *own]
+    assert not history.checkpoint("Nothing new")["committed"]
 
 
 def test_checkpoint_commits_topic_folders_named_like_temporary_files_but_not_backups(
@@ -541,6 +570,45 @@ def test_checkpoint_commits_topic_folders_named_like_temporary_files_but_not_bac
         for name in ("scratch.tmp", "notes.md~", "#notes.md#"):
             (folder / name).write_text("left out", encoding="utf-8")
     assert history.checkpoint("Topics named like temporary files")["committed"]
+    assert tree(tmp_path) == sorted(paths)
+    assert not history.checkpoint("Nothing new")["committed"]
+
+
+def test_checkpoint_commits_topic_folders_named_like_database_files(tmp_path, history):
+    """A topic folder such as tools/app.sqlite3 is committed; database files stay out."""
+    with MemoryStore(tmp_path) as store:
+        fact = store.add("Inventory db", "engine", "SQLite 3.45", valid_from="2025-01-01",
+                         topic="tools/app.sqlite3")
+        path = store.path_for(fact.id).relative_to(store.root).as_posix()
+    tools = tmp_path / "memory" / "tools"
+    (tools / "cache.sqlite3").write_bytes(b"derived")
+    (tools / "app.sqlite3" / "cache.sqlite3-wal").write_bytes(b"derived")
+    assert history.checkpoint("Database topic")["committed"]
+    assert tree(tmp_path) == [path]
+    assert not history.checkpoint("Nothing new")["committed"]
+
+
+@pytest.mark.parametrize("setting", ["default location", "core.excludesFile"])
+def test_your_personal_ignore_file_does_not_hide_records_from_checkpoints(tmp_path, history,
+                                                                          setting):
+    """Topic folders that your personal Git ignore file names are still committed."""
+    personal = Path(os.environ["XDG_CONFIG_HOME"]) / "git" / "ignore"
+    if setting == "core.excludesFile":
+        personal = Path(os.environ["XDG_CONFIG_HOME"]) / "personal-ignore"
+        git(tmp_path, "config", "--file", os.environ["GIT_CONFIG_GLOBAL"], "core.excludesFile",
+            str(personal))
+    personal.parent.mkdir(parents=True, exist_ok=True)
+    personal.write_text("build/\nlogs/\n", encoding="utf-8")
+    paths = []
+    with MemoryStore(tmp_path) as store:
+        for topic in ("general", "projects/build", "work/logs"):
+            fact = store.add("Alex", "note in " + topic, "kept", valid_from="2025-01-01",
+                             topic=topic)
+            paths.append(store.path_for(fact.id).relative_to(store.root).as_posix())
+    # The premise: Git itself ignores these folders in this repository.
+    assert git(tmp_path, "check-ignore", "memory/projects/build", "memory/work/logs").split() == [
+        "memory/projects/build", "memory/work/logs"]
+    assert history.checkpoint("Records in every topic")["committed"]
     assert tree(tmp_path) == sorted(paths)
     assert not history.checkpoint("Nothing new")["committed"]
 
@@ -675,7 +743,7 @@ def test_a_root_spelled_in_another_letter_case_is_the_same_repository(tmp_path):
     identify(root)
     respelled = tmp_path / "CaseTest"
     if not respelled.is_dir():
-        pytest.skip("Needs a case-insensitive file system")
+        pytest.skip("needs a case-insensitive file system")
     _, path = add_fact(respelled)
     history = GitHistory(respelled)
     # The premise: the path keeps the spelling it was given, unlike Git's answer.

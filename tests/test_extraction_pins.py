@@ -18,7 +18,7 @@ from helpers import approved_city, Python310Datetime
 
 import temporal_memory_os.extraction as extraction
 from temporal_memory_os.extraction import ProposalQueue
-from temporal_memory_os.models import normalize_time
+from temporal_memory_os.models import Fact, normalize_time
 from temporal_memory_os.store import MemoryConflictError, MemoryStore
 
 
@@ -254,17 +254,18 @@ def test_undated_restatement_folds_into_a_proposal_whose_approval_was_interrupte
 # Recognizing the fact an interrupted approval wrote
 
 
-def test_approving_a_duplicate_does_not_claim_a_matching_fact_added_after_it(store, queue):
-    """A duplicate proposal never writes a fact, so it never adopts one written later."""
+def test_approving_a_dated_duplicate_adopts_a_matching_fact_added_after_it(store, queue):
+    """A dated restatement writes its own record, so a matching one added later is its write."""
     older = store.add("Alex", "city", "Riverton", valid_from="2025-01-01", source="import")
     line = "Alex | city | Riverton | 2025-02-01"
     [proposal] = queue.extract(line, source="chat")
     assert (proposal.kind, proposal.target_id) == ("duplicate", older.id)
-    store.add("Alex", "city", "Riverton", valid_from="2025-02-01", source="chat", evidence=line)
-    with pytest.raises(MemoryConflictError):
-        queue.approve(proposal.id)
+    added = store.add("Alex", "city", "Riverton", valid_from="2025-02-01", source="chat",
+                      evidence=line)
+    assert queue.approve(proposal.id).id == added.id
     reloaded = queue.get(proposal.id)
-    assert reloaded.status == "pending" and reloaded.result_fact_id is None
+    assert reloaded.status == "approved" and reloaded.result_fact_id == added.id
+    assert [f.id for f in store.all_facts()] == [older.id, added.id]
 
 
 def test_recovery_recognizes_a_fact_recorded_in_the_proposals_clock_tick(store, queue):
@@ -532,3 +533,95 @@ def test_reviewed_record_counts_only_when_strictly_older_than_the_predecessor(st
     assert queue._reviewed_unchanged(update, same_time) is False
     newer = store.add("user", "city", "Oslo", valid_from="2026-02-01", source="chat")
     assert queue._reviewed_unchanged(update, newer) is True
+
+
+# ==========================================================================
+# 0.2.3 review: same-time warnings, matching statements and undated rivals
+# ==========================================================================
+
+
+def test_a_returned_pending_line_still_counts_for_the_same_time_warning(queue):
+    [first] = queue.extract("2024-01-01: Alice | city | Paris", source="chat")
+    results = queue.extract("2024-01-01: Alice | city | Paris\n"
+                            "2024-01-01: Alice | city | London", source="chat")
+    assert results[0].id == first.id
+    london = results[1]
+    assert london.value == "London"
+    assert any("same time" in warning for warning in london.warnings)
+    assert any("same time" in warning for warning in queue.get(london.id).warnings)
+
+
+def test_a_recovered_correction_is_not_claimed_through_a_folder_spelled_like_its_target(
+        store, queue, monkeypatch):
+    """A correction's statement compares by its target's ID, not by a topic folder that
+    spells that ID in another letter case."""
+    target = store.add("user", "city", "Paris", valid_from="2026-01-01", source="chat")
+    folder = target.id.upper()
+    store.add("other", "note", "x", valid_from="2026-01-01", topic=folder)
+    if not (store.memory_dir / target.id).exists():
+        pytest.skip("needs a case-insensitive file system")
+    line = "user | city | Lyon | 2026-01-01"
+    [correction] = queue.extract(line, source="chat")
+    assert (correction.kind, correction.target_id) == ("correct", target.id)
+
+    def crash(self, proposal):
+        raise RuntimeError("process stopped after the fact was written")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ProposalQueue, "_save", crash)
+        with pytest.raises(RuntimeError):
+            queue.approve(correction.id)
+    [written] = [fact for fact in store.all_facts() if fact.supersedes == target.id]
+    # The same line filed under the folder spelled like the target confirms the record.
+    [duplicate] = queue.extract(line, source="chat", topic=folder)
+    assert duplicate.id != correction.id and duplicate.kind == "duplicate"
+    assert queue.approve(duplicate.id).id == written.id
+    # Approving the interrupted correction again completes it with its own record.
+    assert queue.approve(correction.id).id == written.id
+    assert queue.get(correction.id).status == "approved"
+
+
+def test_a_stale_update_stays_stale_beside_a_retracted_record_named_none(tmp_path):
+    with MemoryStore(tmp_path) as store:
+        store.add("e", "a", "x", valid_from="2020-01-01", source="chat")
+        queue = ProposalQueue(store)
+        [proposal] = queue.extract("2022-01-01: e | a | y", source="chat")
+        assert proposal.kind == "update"
+        # A hand-written record whose ID is "None", written after the proposal, then retracted.
+        record = Fact(id="None", entity="e", attribute="a", value="z", valid_from="2021-01-01",
+                      source="chat", recorded_at=normalize_time())
+        folder = tmp_path / "memory" / "general"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "None.md").write_text(MemoryStore._render(record), encoding="utf-8")
+        store.refresh()
+        store.retract("None")
+        assert not [fact for fact in store.snapshot(as_of="2022-01-01") if fact.entity == "e"]
+        with pytest.raises(MemoryConflictError):
+            queue.approve(proposal.id)
+
+
+def test_a_second_correction_under_another_topic_is_not_claimed_by_the_first(store, queue):
+    store.add("e", "a", "x", valid_from="2020-01-01", source="chat")
+    [first] = queue.extract("2020-01-01: e | a | y", source="chat", topic="one")
+    [second] = queue.extract("2020-01-01: e | a | y", source="chat", topic="two")
+    assert first.kind == second.kind == "correct"
+    assert first.target_id == second.target_id
+    queue.approve(first.id)
+    with pytest.raises(MemoryConflictError):
+        queue.approve(second.id)
+
+
+def test_an_undated_restatement_ignores_a_rival_from_the_same_instant(queue):
+    first = queue.extract("My city is Paris\nMy city is London", source="chat")
+    paris = next(proposal for proposal in first if proposal.value == "Paris")
+    assert [proposal.id for proposal in queue.extract("My city is Paris", source="chat")] == [
+        paris.id]
+    assert len(queue.list()) == 2
+
+
+def test_a_value_restated_after_a_new_rival_in_the_same_text_is_new(queue):
+    [paris] = queue.extract("My city is Paris", source="chat")
+    result = queue.extract("My city is London\nMy city is Paris", source="chat")
+    assert [proposal.value for proposal in result] == ["London", "Paris"]
+    assert result[1].id != paris.id
+    assert len(queue.list()) == 3

@@ -118,6 +118,8 @@ def line_chart(series, title, subtitle):
     values = [row[metric] for _, _, rows, metric, _ in series for row in rows]
     low = 10 ** math.floor(math.log10(min(values)))
     high = 10 ** math.ceil(math.log10(max(values)))
+    if high <= low:  # Every value is the same power of ten; show one decade above it.
+        high = low * 10
 
     def x(size):
         span = math.log10(sizes[-1]) - math.log10(sizes[0]) or 1

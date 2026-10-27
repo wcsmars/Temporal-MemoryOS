@@ -4,7 +4,8 @@ Covers time shifting on Python 3.10, opening and lock retries, repair of a
 damaged index, file modes, the folder scan, the racy-timestamp rule, records
 that are not UTF-8, cross-record validation, verification marking, the
 record writer's refusals and cleanup, lookups, the audit trail, record titles,
-folder durability, what the index file holds, and messages that name files.
+folder durability, what the index file holds, messages that name files, damage
+reported without text, and topics spelled like the folders that hold them.
 """
 
 import errno
@@ -1230,3 +1231,82 @@ def test_a_linked_index_log_file_is_refused_by_its_exact_name(tmp_path, monkeypa
     monkeypatch.setattr(Path, "is_symlink", case_sensitive_is_symlink)
     with pytest.raises(ValueError, match="symbolic link"):
         MemoryStore(tmp_path)
+
+
+# ==========================================================================
+# 0.2.3 review: damage reported without text, and topics spelled like folders
+# ==========================================================================
+
+
+class UntextedDamage:
+    """Stands in for Python 3.10, which raises a bare DatabaseError when SQLite's
+    message about damaged bytes cannot be decoded."""
+
+    def execute(self, *_arguments):
+        raise sqlite3.DatabaseError()
+
+    def close(self):
+        pass
+
+
+def test_damage_reported_without_any_text_still_gets_the_repair_hint(tmp_path, monkeypatch):
+    MemoryStore(tmp_path).close()
+    monkeypatch.setattr(MemoryStore, "_connect", lambda self: UntextedDamage())
+    with pytest.raises(StoreIntegrityError, match="memoryos reindex"):
+        MemoryStore(tmp_path)
+
+
+def test_only_a_bare_database_error_without_text_counts_as_damage():
+    """Its subclasses without text (a trigger's empty RAISE, for example) are not damage."""
+    assert store_module._damaged(sqlite3.DatabaseError()) is True
+    assert store_module._damaged(sqlite3.IntegrityError()) is False
+    assert store_module._damaged(sqlite3.OperationalError()) is False
+
+
+def test_a_revision_follows_the_spelling_of_a_nested_folder(tmp_path):
+    """The whole topic path is compared with the folder, not only its last part."""
+    with MemoryStore(tmp_path) as memory:
+        fact = memory.add("person", "drink", "tea", valid_from="2025-01-01", topic="Work/projects")
+    record = tmp_path / "memory" / "Work" / "projects" / (fact.id + ".md")
+    text = record.read_text(encoding="utf-8")
+    assert '"topic": "Work/projects"' in text
+    record.write_text(text.replace('"topic": "Work/projects"', '"topic": "work/projects"'),
+                      encoding="utf-8")  # As an earlier release filed it on a Mac.
+    with MemoryStore(tmp_path) as memory:
+        assert memory.get(fact.id).topic == "work/projects"
+        revised = memory.correct(fact.id, "coffee")
+    assert revised.topic == "Work/projects"
+    assert (tmp_path / "memory" / "Work" / "projects" / (revised.id + ".md")).exists()
+
+
+def test_a_revision_of_a_record_moved_to_another_folder_keeps_its_own_topic(tmp_path):
+    """Only a folder that differs from the topic in letter case changes the spelling."""
+    with MemoryStore(tmp_path) as memory:
+        fact = memory.add("person", "drink", "tea", valid_from="2025-01-01", topic="home")
+    archive = tmp_path / "memory" / "archive"
+    archive.mkdir()
+    (tmp_path / "memory" / "home" / (fact.id + ".md")).rename(archive / (fact.id + ".md"))
+    with MemoryStore(tmp_path) as memory:
+        revised = memory.correct(fact.id, "coffee")
+    assert revised.topic == "home"
+    assert (tmp_path / "memory" / "home" / (revised.id + ".md")).exists()
+
+
+def test_existing_topic_keeps_the_given_spelling_from_a_segment_that_is_not_a_folder(store):
+    """".." exists on disk but is never listed as a folder: the rest is kept as given."""
+    store.add("person", "drink", "tea", valid_from="2025-01-01", topic="work")
+    assert store.existing_topic("..") == ".."
+    assert store.existing_topic("work/../x") == "work/../x"
+
+
+@pytest.mark.parametrize("folder", [False, True])
+def test_a_link_scans_as_the_placeholder_signature(store, tmp_path, folder):
+    """A file or folder link scans as (-1, -1), the signature a race can store; no file has it."""
+    outside = tmp_path / ("outside" if folder else "outside.md")
+    if folder:
+        outside.mkdir()
+    else:
+        outside.write_text("linked note\n", encoding="utf-8")
+    name = "attachments" if folder else "linked.md"
+    (store.memory_dir / name).symlink_to(outside, target_is_directory=folder)
+    assert store._scan()["memory/" + name] == (-1, -1)

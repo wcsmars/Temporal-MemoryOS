@@ -290,3 +290,16 @@ def test_evaluate_reports_the_nearest_rank_p95(monkeypatch):
     result = run.evaluate(questions, lambda question: None)
     assert result["latency_ms_p95"] == 95.0
     assert result["latency_ms_median"] == 50.5
+
+
+def test_plot_charts_values_that_are_all_the_same_power_of_ten(results_copy):
+    """A chart whose values all equal one power of ten still renders."""
+    def flatten(report):
+        for row in report["results"]:
+            row.update({metric: 10.0 for metric in plot.SCALE_METRICS})
+
+    _edit(results_copy, "scale-current.json", flatten)
+    _edit(results_copy, "scale-v0.1.json", flatten)
+    rendered = plot.charts(results_copy)
+    assert set(rendered) == {path.name for path in RESULTS.glob("*.svg")}
+    assert "nan" not in rendered["scale-write.svg"]

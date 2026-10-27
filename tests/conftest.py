@@ -17,9 +17,10 @@ Hypothesis profiles, chosen with the ``HYPOTHESIS_PROFILE`` environment variable
 Every test also runs isolated from the developer's environment: ``MEMORYOS_*``
 variables are cleared, and Git reads no global or system configuration, no
 global ignore or attribute files and no repository location or identity
-variables. A global ``commit.gpgsign``, hook directory or exported
-``GIT_DIR`` therefore cannot change a test's outcome. Tests that need a Git
-identity set one themselves.
+variables. Git also stops looking for a repository at pytest's base temp
+folder. A global ``commit.gpgsign``, hook directory, exported ``GIT_DIR`` or
+a TMPDIR inside a Git checkout therefore cannot change a test's outcome.
+Tests that need a Git identity set one themselves.
 """
 
 import itertools
@@ -76,3 +77,6 @@ def isolated_environment(monkeypatch, tmp_path_factory):
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     # Git reads its global ignore and attribute files from here.
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home))
+    # Git stops looking for a repository at pytest's base temp folder, so a
+    # TMPDIR inside a Git checkout does not put every test inside that checkout.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path_factory.getbasetemp().resolve()))

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "temporal-memory-os"
-version = "0.2.2"
+dynamic = ["version"]
 description = "Editable, auditable, time-aware memory for AI agents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,6 +17,7 @@ classifiers = [
   "Operating System :: POSIX",
   "Topic :: Database",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Typing :: Typed",
 ]
 dependencies = []
 
@@ -45,6 +46,10 @@ memoryos = "temporal_memory_os.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+# One source for the version: the package's own __version__, which the API and MCP server report.
+version = {attr = "temporal_memory_os.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -19,7 +19,8 @@ from typing import Any, List, Optional, Protocol, Sequence
 
 _TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
 # Dropped from queries (not from documents) so that question words do not make
-# every fact look relevant. A query made only of these words keeps them.
+# every fact look relevant. A query made only of these words matches nothing,
+# unless it names an entity whose name uses them ("The Who").
 STOPWORDS = frozenset("""
 a about an and are as at be been but by can could did do does for from had has have he her
 hers him his how i if in into is it its just me my of on or our she so that the their them
@@ -67,15 +68,8 @@ def normalized_tokens(text: str) -> List[str]:
     return [_ALIASES.get(token, token) for token in tokenize(text)]
 
 
-def query_terms(text: str) -> List[str]:
-    """Normalized query tokens without stopwords, unless nothing else is left."""
-    tokens = normalized_tokens(text)
-    content = [token for token in tokens if token not in STOPWORDS]
-    return content or tokens
-
-
 class EmbeddingUnavailableError(RuntimeError):
-    """The configured embedding model could not be loaded or run."""
+    """The configured embedding model could not be loaded or run, or returned unusable vectors."""
 
 
 class Embedder(Protocol):
@@ -157,12 +151,14 @@ class SentenceTransformerEmbedder:
     def _load(self) -> None:
         try:
             from sentence_transformers import SentenceTransformer
-        except ImportError as error:
-            raise EmbeddingUnavailableError(
-                "Semantic embeddings need the optional dependency: from a source checkout, "
-                "pip install -e '.[semantic]'"
-            ) from error
         except Exception as error:  # A broken torch install can fail with OSError and others.
+            # Only a missing package gets the install hint. An installed one whose
+            # own imports fail (a mismatched transformers, say) needs the cause.
+            if isinstance(error, ModuleNotFoundError) and error.name == "sentence_transformers":
+                raise EmbeddingUnavailableError(
+                    "Semantic embeddings need the optional dependency: from a source checkout, "
+                    "pip install -e '.[semantic]'"
+                ) from error
             raise EmbeddingUnavailableError("Could not import sentence-transformers ({}: {})".format(
                 type(error).__name__, error)) from error
         try:

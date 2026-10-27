@@ -16,15 +16,21 @@ import os
 from pathlib import Path
 import re
 import tempfile
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+import unicodedata
 from uuid import uuid4
 
 from .models import Fact, _text, normalize_time, validate_topic
-from .store import MemoryConflictError, MemoryStore, _flush_directory
+from .store import MemoryConflictError, MemoryStore, StoreIntegrityError, _flush_directory
 
 _PROPOSAL_ID = re.compile(r"[a-f0-9]{32}")
 _STATUSES = ("pending", "approved", "rejected")
 _KINDS = ("add", "update", "correct", "duplicate")
+# A possible sentence end: the word before it, a terminator, any closing quotes or
+# brackets, then a space. A match starts only at the start of that word, so a long
+# word is scanned once.
+_SENTENCE_END = re.compile(
+    r"(?<!\w)(\w*)([.!?])[\"'\u201d\u2019\u00bb\u203a)\]}\u300d\u300f\u3011\uff09\uff3d\uff5d]*\s")
 
 
 def _now() -> str:
@@ -59,7 +65,8 @@ def _well_typed(proposal: "Proposal") -> bool:
                for name in optional):
         return False
     if (isinstance(proposal.confidence, bool) or not isinstance(proposal.confidence, (int, float))
-            or not isinstance(proposal.dated, bool) or not isinstance(proposal.warnings, list)
+            or not isinstance(proposal.dated, bool) or not isinstance(proposal.observed, bool)
+            or not isinstance(proposal.warnings, list)
             or not all(isinstance(item, str) for item in proposal.warnings)):
         return False
     try:
@@ -73,6 +80,44 @@ def _well_typed(proposal: "Proposal") -> bool:
     if proposal.status == "approved" and not proposal.result_fact_id:
         return False
     return True
+
+
+def _line(proposal: "Proposal") -> Tuple[str, ...]:
+    """The line a proposal was extracted from, and where it was extracted to."""
+    return (proposal.entity, proposal.attribute, proposal.value, proposal.source,
+            proposal.evidence, proposal.topic)
+
+
+def _statement(proposal: "Proposal") -> Tuple[Any, ...]:
+    """What approving ``proposal`` asserts. A correction keeps its target's
+    topic folder, so the target stands in for the topic."""
+    return (proposal.entity, proposal.attribute, proposal.value, proposal.valid_from,
+            proposal.source, proposal.evidence, proposal.confidence,
+            proposal.target_id if proposal.kind == "correct" else proposal.topic)
+
+
+def _content(line: str) -> str:
+    # Files joined with cat keep each one's byte-order mark, at a line start.
+    return line.strip().lstrip("\ufeff").strip()
+
+
+def _more_than_one_sentence(statement: str) -> bool:
+    """A sentence ends before the line does. A period after an initial ("J.") or a
+    two-letter abbreviation ("Dr.", "St.") does not end a sentence; capital and small
+    letters are those of any script, so an accented initial counts too, however
+    its accent is encoded."""
+    for match in _SENTENCE_END.finditer(unicodedata.normalize("NFC", statement)):
+        word = match[1]
+        if match[2] == "." and (len(word) == 1 and word.isupper()
+                                or len(word) == 2 and word[0].isupper() and word[1].islower()):
+            continue
+        return True
+    return False
+
+
+def _reason(error: OSError) -> str:
+    # str(error) would show the absolute path of the memory directory.
+    return error.strerror or type(error).__name__
 
 
 def _required(value: Optional[str], name: str) -> str:
@@ -103,6 +148,9 @@ class Proposal:
     # False when the line had no date and took the observation time; such a
     # line is the same statement whenever it is extracted again.
     dated: bool = True
+    # True when an undated line took an explicit observation time (observed_at)
+    # rather than "now". Files written before this field load as False.
+    observed: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -115,7 +163,7 @@ class ProposalQueue:
         self.store = store
         self.directory = Path(store.root) / "proposals"
         if self.directory.is_symlink():
-            raise ValueError("Proposal directory must not be a symbolic link")
+            raise StoreIntegrityError("Proposal directory must not be a symbolic link")
         self.directory.mkdir(parents=True, exist_ok=True)
         self.problems: List[str] = []  # Damaged files skipped by the last list().
 
@@ -125,7 +173,7 @@ class ProposalQueue:
         import fcntl
         lock_path = self.directory / ".lock"
         if lock_path.is_symlink():
-            raise ValueError("Proposal lock must not be a symbolic link")
+            raise StoreIntegrityError("Proposal lock must not be a symbolic link")
         with lock_path.open("a") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX)
             try:
@@ -138,7 +186,8 @@ class ProposalQueue:
             raise ValueError("Invalid proposal ID")
         path = self.directory / (proposal_id + ".json")
         if path.is_symlink():
-            raise ValueError("Proposal files must not be symbolic links")
+            raise StoreIntegrityError("Proposal files must not be symbolic links: proposals/"
+                                      + path.name)
         return path
 
     def _save(self, proposal: Proposal) -> None:
@@ -166,6 +215,9 @@ class ProposalQueue:
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             # Very deep nesting raises RecursionError.
             raise ValueError("{} is not valid JSON; fix or delete it".format(name)) from exc
+        except OSError as exc:  # Unreadable, or a folder with a proposal's name.
+            raise StoreIntegrityError("{} cannot be read ({}); fix or delete it".format(
+                name, _reason(exc))) from exc
         try:
             # JSON can escape a lone surrogate ("\ud800"), which no output can encode.
             json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -202,8 +254,11 @@ class ProposalQueue:
                 continue
             try:
                 proposals.append(self.get(path.stem))
-            except (ValueError, OSError) as exc:
+            except ValueError as exc:  # These name the file relative to the memory directory.
                 self.problems.append(str(exc))
+            except OSError as exc:
+                self.problems.append("proposals/{} cannot be read ({})".format(
+                    path.name, _reason(exc)))
         return sorted([p for p in proposals if status in (None, "all") or p.status == status],
                       key=lambda p: (normalize_time(p.created_at), p.id))
 
@@ -273,6 +328,13 @@ class ProposalQueue:
             if len(parts) not in (3, 4) or not all(parts[:3]):
                 return None  # Prose or a table that happens to contain "|".
             return parts[0], parts[1], parts[2], 1.0, parts[3] if len(parts) == 4 else ""
+        # A sentence rule matches the whole line, so a second sentence on it would end
+        # up in the value ("Paris. I moved here", "Paris.) I moved"): such a line is
+        # skipped. A period after an initial or a two-letter abbreviation ("J. P. Morgan",
+        # "Dr. Smith", "St. Louis") does not end a sentence; other values with a period
+        # followed by a space ("Mrs. Jones") need the pipe form.
+        if _more_than_one_sentence(statement):
+            return None
         # The name is matched greedily up to the last " is ", so names such as
         # "This Is Corp" stay whole.
         # Prose patterns. A value made only of punctuation is not a statement.
@@ -291,10 +353,12 @@ class ProposalQueue:
 
     def extract(self, text: str, source: str, observed_at: Optional[str] = None,
                 topic: str = "general") -> List[Proposal]:
-        if not isinstance(text, str) or not text.lstrip("\ufeff").strip():
-            raise ValueError("Conversation text must not be empty")
-        if len(text) > 1_000_000:
+        if isinstance(text, str) and len(text) > 1_000_000:  # Before splitting it.
             raise ValueError("Conversation exceeds the 1 MB extraction limit")
+        # Empty by the same reading as the lines below, so a byte-order mark on each
+        # of several lines is still empty text.
+        if not isinstance(text, str) or not any(_content(line) for line in text.splitlines()):
+            raise ValueError("Conversation text must not be empty")
         if not isinstance(source, str) or not source.strip():
             raise ValueError("A provenance source is required")
         # Rejected up front: every line's record would fail validation on them.
@@ -305,8 +369,8 @@ class ProposalQueue:
             observed_at = None  # An empty time means "now", as when it is omitted.
         observed = normalize_time(_now() if observed_at is None else observed_at)
         candidates = []
-        for line in text.lstrip("\ufeff").splitlines():
-            raw = line.strip()
+        for line in text.splitlines():
+            raw = _content(line)
             if not raw or raw.startswith("#"):
                 continue
             parsed = self._parse_line(raw, observed)
@@ -323,75 +387,135 @@ class ProposalQueue:
             except ValueError:
                 continue
             candidates.append((entity, attribute, value, effective, raw, confidence, dated))
-        # Each attribute holds one value at a time: two lines giving the same
-        # attribute for the same instant cannot both be approved.
-        instants: Dict[Tuple[str, str, str], int] = {}
-        for entity, attribute, _, effective, *_ in candidates:
-            instants[(entity, attribute, effective)] = instants.get(
-                (entity, attribute, effective), 0) + 1
         with self._lock():
             self.store.refresh()
-            existing = self.list(status="all")
-            results = []
+            # Indexed, so a long text is not compared with the whole queue line by line.
+            statements: Dict[Tuple[str, ...], List[Proposal]] = {}
+            histories: Dict[Tuple[str, str], List[Proposal]] = {}
+
+            def remember(proposal: Proposal) -> None:
+                statements.setdefault(_line(proposal), []).append(proposal)
+                histories.setdefault((proposal.entity, proposal.attribute), []).append(proposal)
+
+            for proposal in self.list(status="all"):
+                remember(proposal)
+            # Where this text last states each line, so a re-extracted log keeps its order.
+            last: Dict[Tuple[str, ...], int] = {
+                (entity, attribute, value, source, raw, topic): index
+                for index, (entity, attribute, value, _, raw, *_) in enumerate(candidates)}
+            # A line followed in this text by another value for its attribute was said
+            # before that value; only a line no other value follows can be a new
+            # statement. The same line again later is not another value.
+            followed: List[bool] = []
+            values_after: Dict[Tuple[str, str], set[str]] = {}
+            for entity, attribute, value, *_ in reversed(candidates):
+                values = values_after.setdefault((entity, attribute), set())
+                followed.append(len(values) > (value in values))  # Another value follows.
+                values.add(value)
+            followed.reverse()
+            results: List[Proposal] = []
+            returned: set[str] = set()
+            new: List[Proposal] = []
+            # Each attribute holds one value at a time: two lines giving the same
+            # attribute for the same instant cannot both be approved. A repeated line
+            # is the same statement, not a second one, and a line that returns a
+            # pending proposal counts at that proposal's time.
+            instants: Dict[Tuple[str, str, str], set[str]] = {}
             created = ""
-            for entity, attribute, value, effective, raw, confidence, dated in candidates:
-                duplicate = next((p for p in existing if p.status != "rejected" and
-                                  (p.entity, p.attribute, p.value, p.source, p.evidence, p.topic)
-                                  == (entity, attribute, value, source, raw, topic)
+            for index, (entity, attribute, value, effective, raw, confidence,
+                        dated) in enumerate(candidates):
+                same = statements.get((entity, attribute, value, source, raw, topic), [])
+                duplicate = next((p for p in same if p.status != "rejected"
                                   and (p.valid_from == effective
-                                       or self._same_undated(p, dated, observed_at, observed))),
+                                       or self._same_undated(
+                                           p, dated, observed_at, observed,
+                                           histories[(entity, attribute)],
+                                           lambda other: (followed[index]
+                                                          or last.get(_line(other), -1) > index)))),
                                  None)
                 if duplicate:
-                    results.append(duplicate)
+                    instants.setdefault((entity, attribute, duplicate.valid_from), set()).add(raw)
+                    if duplicate.id not in returned:  # A repeated line is returned once.
+                        returned.add(duplicate.id)
+                        results.append(duplicate)
                     continue
-                classified = self._classify(entity, attribute, value, effective)
-                if instants[(entity, attribute, effective)] > 1:
-                    classified.setdefault("warnings", []).append(
-                        "Another line in this text gives {} for the same time; only one can be "
-                        "approved.".format(attribute))
+                instants.setdefault((entity, attribute, effective), set()).add(raw)
                 proposal = Proposal(id=uuid4().hex, entity=entity, attribute=attribute, value=value,
                                     valid_from=effective, source=source, evidence=raw, topic=topic,
                                     created_at=(created := _after(created)),
-                                    confidence=confidence, dated=dated, **classified)
-                self._save(proposal)
-                existing.append(proposal)
+                                    confidence=confidence, dated=dated,
+                                    observed=not dated and observed_at is not None,
+                                    **self._classify(entity, attribute, value, effective))
+                remember(proposal)
+                new.append(proposal)
+                returned.add(proposal.id)
                 results.append(proposal)
+            for proposal in new:
+                if len(instants[(proposal.entity, proposal.attribute, proposal.valid_from)]) > 1:
+                    proposal.warnings.append(
+                        "Another line in this text gives {} for the same time; only one can be "
+                        "approved.".format(proposal.attribute))
+                self._save(proposal)
             return results
 
     def _same_undated(self, pending: Proposal, dated: bool, observed_at: Optional[str],
-                      now: str) -> bool:
+                      now: str, queued: List[Proposal],
+                      stated_later: Callable[[Proposal], bool]) -> bool:
         """An undated line extracted again "now" is the statement already pending,
-        unless memory has moved past it since (then it is new information). A value
-        that takes effect only after ``now`` has not moved past it yet."""
+        unless memory has moved past it since (then it is new information): a
+        value took effect after it, or a different value was proposed after it.
+        A value that takes effect only after ``now`` has not moved past it yet.
+
+        ``queued`` holds the proposals for the pending one's entity and attribute.
+        ``stated_later`` tells whether the text being extracted states a
+        proposal's line again after this line: that value was said after this
+        line, so re-extracting an unchanged log is not new information.
+        """
         # The line's own flag decides: the evidence is the same line, and proposal
         # files written before the flag existed load as dated.
         if dated or pending.status != "pending" or observed_at is not None:
             return False
         later = [fact for fact in self.store.history(pending.entity, pending.attribute)
                  if pending.valid_from < fact.valid_from <= now]
-        return not later
+        # Not yet approved, but approving the queue in order would otherwise end on
+        # that different value although this statement was made after it.
+        said = [other for other in queued
+                if other.status != "rejected" and other.value != pending.value
+                and pending.valid_from < other.valid_from <= now and not stated_later(other)]
+        return not later and not said
 
     def _produced(self, proposal: Proposal) -> Optional[Fact]:
         """The fact an interrupted approval already wrote, if any.
 
         Fact writes and proposal status are separate files; a crash between
         them leaves a pending proposal whose fact exists. Approving again
-        recognizes that fact instead of reporting a conflict.
+        recognizes that fact instead of reporting a conflict. A duplicate can
+        have written one too: a dated restatement, or a return to an earlier
+        value approved in order.
         """
-        if proposal.kind == "duplicate":
-            return None
         created = normalize_time(proposal.created_at)
-        claimed = {other.result_fact_id for other in self.list(status="approved")}
-        for fact in self.store.audit_trail(proposal.entity, proposal.attribute):
-            if ((fact.value, fact.valid_from, fact.source, fact.evidence, fact.confidence)
+        # A new record takes the spelling of an existing topic folder (see approve).
+        topics = {proposal.topic, self.store.existing_topic(proposal.topic)}
+        matching = [fact for fact in self.store.audit_trail(proposal.entity, proposal.attribute)
+                    if (fact.value, fact.valid_from, fact.source, fact.evidence, fact.confidence)
                     == (proposal.value, proposal.valid_from, proposal.source, proposal.evidence,
                         proposal.confidence)
                     and not fact.deleted and fact.recorded_at >= created
-                    and fact.id not in claimed
                     and (fact.supersedes == proposal.target_id if proposal.kind == "correct"
-                         else fact.supersedes is None and fact.topic == proposal.topic)):
-                return fact
-        return None
+                         else fact.supersedes is None and fact.topic in topics)]
+        if not matching:
+            return None  # The usual case: no need to read every approved proposal.
+        # Only an approved proposal stating the same thing can have written a matching
+        # fact. One approved as a duplicate of it merely points at it.
+        def stated(other: Proposal) -> Tuple[Any, ...]:
+            # Topics compare by the folder they name, as the matching facts do.
+            *rest, where = _statement(other)
+            return (*rest, where if other.kind == "correct" else self.store.existing_topic(where))
+
+        own = stated(proposal)
+        claimed = {other.result_fact_id for other in self.list(status="approved")
+                   if stated(other) == own}
+        return next((fact for fact in matching if fact.id not in claimed), None)
 
     def approve(self, proposal_id: str) -> Fact:
         with self._lock():
@@ -414,8 +538,13 @@ class ProposalQueue:
                 # Only an expected predecessor changed the preview: apply what it needs now.
                 kind = self._check_still_valid(proposal, current)
                 target_id = current.get("target_id")
-            if kind == "duplicate":
-                result = self.store.get(_required(target_id, "target_id"))
+            confirmed = (self.store.get(_required(target_id, "target_id"))
+                         if kind == "duplicate" else None)
+            if confirmed is not None and ((not proposal.dated and not proposal.observed)
+                                          or confirmed.valid_from == proposal.valid_from):
+                # Nothing new: an undated line extracted "now" restates what holds now,
+                # and a line for the confirmed record's own date restates that record.
+                result = confirmed
             elif kind == "correct":
                 # The corrected record keeps its topic folder; the confidence is
                 # that of the new statement.
@@ -424,10 +553,18 @@ class ProposalQueue:
                                             evidence=proposal.evidence,
                                             confidence=proposal.confidence)
             else:
+                # A line restating the value in effect at its own date (or observation
+                # time) is recorded too, so a change approved later for an earlier date
+                # cannot override it. It keeps the confirmed record's own end (as stored,
+                # not as bounded by the next value), so it never extends the value past
+                # an explicit end. On a case-insensitive disk, a topic spelled unlike
+                # its existing folder is filed there under the folder's spelling.
                 result = self.store.add(entity=proposal.entity, attribute=proposal.attribute,
                                         value=proposal.value, valid_from=proposal.valid_from,
+                                        valid_to=None if confirmed is None else confirmed.valid_to,
                                         source=proposal.source, evidence=proposal.evidence,
-                                        confidence=proposal.confidence, topic=proposal.topic)
+                                        confidence=proposal.confidence,
+                                        topic=self.store.existing_topic(proposal.topic))
             proposal.status, proposal.result_fact_id = "approved", result.id
             self._save(proposal)
             return result
@@ -439,8 +576,11 @@ class ProposalQueue:
         approved from the same source after this proposal was made, effective
         before it, is an expected predecessor: the proposal then adds its value
         ("update"), or confirms the value that record already holds
-        ("duplicate"). Anything else (including an edit of the record the
-        reviewer saw, even with the same ID) needs a new review.
+        ("duplicate", recorded at its own date). A newer record from any source
+        that restates the prior value the reviewer saw, such as an approved dated
+        restatement, changes nothing the preview showed either. Anything else
+        (including an edit of the record the reviewer saw, even with the same ID)
+        needs a new review.
         """
         stale = MemoryConflictError("Memory changed since this proposal; reject it and extract "
                                     "again")
@@ -455,13 +595,19 @@ class ProposalQueue:
                         and (proposal.target_id is None
                              or self._reviewed_unchanged(proposal, predecessor))):
                     return str(kind)
+                if (kind == proposal.kind and proposal.target_id is not None
+                        and predecessor.value == proposal.prior_value
+                        and predecessor.valid_from <= proposal.valid_from
+                        and self._reviewed_unchanged(proposal, predecessor)):
+                    return str(kind)
             if (proposal.kind == "add" and current.get("kind") in ("correct", "duplicate")
                     and target is not None
                     and self.store.get(str(target)).source == proposal.source):
                 raise MemoryConflictError(
                     "Another proposal from the same source already set {} for this time; each "
-                    "attribute holds one value at a time, so reject this one, or extract it "
-                    "again to review it as a correction".format(proposal.attribute))
+                    "attribute holds one value at a time, so reject this one; to replace that "
+                    "value with it instead, reject this one first, then extract it again to "
+                    "review the change".format(proposal.attribute))
         except KeyError:
             raise stale from None  # A record the reviewer saw is gone.
         raise stale
@@ -476,12 +622,42 @@ class ProposalQueue:
         return (predecessor.valid_from > reviewed.valid_from and in_effect == [reviewed.id]
                 and _fingerprint(reviewed) == proposal.target_fingerprint)
 
+    def _orphaned_by_reject(self, proposal: Proposal) -> bool:
+        """Rejecting ``proposal`` would leave a fact in memory with no approval behind it.
+
+        That is the case when an interrupted approval wrote the fact it states, that
+        fact has not been retracted or corrected since (a revision carries its own
+        provenance), and no other pending proposal can claim it. On a
+        case-insensitive disk, the same line under another letter case of its topic
+        names the same folder, so that proposal claims the fact just as well.
+        """
+        produced = self._produced(proposal)
+        if produced is None:
+            return False
+        if any(fact.supersedes == produced.id
+               for fact in self.store.audit_trail(proposal.entity, proposal.attribute)):
+            return False
+        # Topics aside, a proposal that can claim the fact states the same thing.
+        stated = _statement(proposal)[:-1]
+        for other in self.list(status="pending"):
+            if other.id != proposal.id and _statement(other)[:-1] == stated:
+                claim = self._produced(other)
+                if claim is not None and claim.id == produced.id:
+                    return False
+        return True
+
     def reject(self, proposal_id: str) -> Proposal:
         with self._lock():
             proposal = self.get(proposal_id)
             if proposal.status == "approved":
                 raise MemoryConflictError(
                     "Approved proposals cannot be rejected; retract the fact instead")
+            if proposal.status == "pending":
+                self.store.refresh()
+                if self._orphaned_by_reject(proposal):
+                    raise MemoryConflictError(
+                        "An interrupted approval already wrote this proposal's fact; approve it "
+                        "again to finish, then retract the fact if it is wrong")
             proposal.status = "rejected"
             self._save(proposal)
             return proposal

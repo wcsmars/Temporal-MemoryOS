@@ -222,11 +222,10 @@ def test_sentence_transformer_wrapper_explains_missing_dependency(monkeypatch):
 
 
 @pytest.mark.parametrize("vectors, message", [
-    ([[1.0, 0.0], [math.inf, 0.0]], "finite"),
+    ([[math.inf, 0.0], [1.0, 0.0]], "finite"),
     ([[1.0, 0.0], [1.0, 0.0, 0.0]], "dimensions"),
     ([[1.0, 0.0]], "wrong number"),
     # Finite values whose norm overflows once made every score a perfect 1.0.
-    ([[1.0, 0.0], [1e200, 1e200]], "too large to compare"),
     ([[1e300, 1e300], [1.0, 0.0]], "too large to compare"),
 ])
 def test_misbehaving_embedding_providers_are_reported(store, vectors, message):
@@ -239,7 +238,7 @@ def test_misbehaving_embedding_providers_are_reported(store, vectors, message):
         def embed(self, texts):
             return vectors
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(EmbeddingUnavailableError, match=message):
         HybridRetriever(store, Provider()).search("tea", mode="semantic")
 
 

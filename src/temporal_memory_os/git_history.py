@@ -25,10 +25,15 @@ _MARKER_KEY = "memoryos.checkpoints"
 _EXCLUDE_HEADER = "# Temporal MemoryOS derived/local files"
 # Dot-named files are editor locks, swap files and interrupted writes; the
 # store ignores them, so checkpoints do too. Temporary files and editor backups
-# ("notes.md~", "#notes.md#") are left out as well. "!*.tmp/" keeps a topic
-# folder named like "notes.tmp" in: "*.tmp" alone would hide its records.
-_EXCLUDES = (".memoryos/", "*.sqlite3*", ".env", "proposals/.lock", "*.tmp", "!*.tmp/",
-             "/memory/**/.*", "/proposals/.*", "/memory/**/*~", "/memory/**/#*#")
+# ("notes.md~", "#notes.md#") are left out as well. "!*.sqlite3*/" and "!*.tmp/"
+# keep topic folders named like "app.sqlite3" or "notes.tmp" in: the file rules
+# alone would hide their records.
+_EXCLUDES = (".memoryos/", "*.sqlite3*", "!*.sqlite3*/", ".env", "proposals/.lock", "*.tmp",
+             "!*.tmp/", "/memory/**/.*", "/proposals/.*", "/memory/**/*~", "/memory/**/#*#")
+# Your personal ignore file (core.excludesFile, or ~/.config/git/ignore) often
+# lists names such as build/ or logs/. Staging must not let it hide records in
+# topic folders with those names, so only the rules above apply.
+_OWN_EXCLUDES_ONLY = ("-c", "core.excludesFile=")
 _TARGETS = ("memory", "proposals")
 _TIMEOUT = 600
 
@@ -83,18 +88,27 @@ class GitHistory:
     def _adopt(self) -> None:
         """Mark the repository as MemoryOS's and make sure local files stay out of it.
 
-        Nothing is written when both are already in place, so concurrent
-        checkpoints do not compete for Git's config lock.
+        The MemoryOS block of the exclude file always holds every rule in the
+        order above, because Git applies the last rule that matches: a rule
+        added by an upgrade must not land after the dot-file and backup rules.
+        Lines before the block and your own lines after it are kept. Nothing is
+        written when both are already in place, so concurrent checkpoints do
+        not compete for Git's config lock.
         """
         if self._git("config", "--local", "--get", _MARKER_KEY, check=False).stdout.strip() != "true":
             self._git("config", "--local", _MARKER_KEY, "true")
         exclude = self._exclude_path()
         exclude.parent.mkdir(parents=True, exist_ok=True)
         present = exclude.read_text(encoding="utf-8").splitlines() if exclude.is_file() else []
-        kept = list(present)
-        missing = [rule for rule in _EXCLUDES if rule not in kept]
-        if missing or kept != present:
-            lines = kept + ([] if _EXCLUDE_HEADER in kept else ["", _EXCLUDE_HEADER]) + missing
+        if _EXCLUDE_HEADER in present:
+            cut = present.index(_EXCLUDE_HEADER)
+            before = present[:cut]
+            own = [line for line in present[cut + 1:]
+                   if line not in _EXCLUDES and line != _EXCLUDE_HEADER]
+        else:
+            before, own = present + [""], []
+        lines = before + [_EXCLUDE_HEADER, *_EXCLUDES] + own
+        if lines != present:
             exclude.write_text("\n".join(lines).strip("\n") + "\n", encoding="utf-8")
 
     def _is_root(self, path: Optional[Path]) -> bool:
@@ -186,7 +200,7 @@ class GitHistory:
         tracked = {name for name in targets if known(name)}
         present = [name for name in targets if (self.root / name).is_dir() or name in tracked]
         if present:
-            self._git("add", "--all", "--", *present)
+            self._git(*_OWN_EXCLUDES_ONLY, "add", "--all", "--", *present)
         # Commit folders that had or now have tracked files (a deletion counts).
         targets = [name for name in present if name in tracked or known(name)]
         if not targets:

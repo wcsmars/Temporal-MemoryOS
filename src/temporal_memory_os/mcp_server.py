@@ -6,8 +6,10 @@ The server only speaks MCP on stdout. SDK diagnostics go to stderr.
 
 import json
 import os
+import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Optional, Union
+from typing import TYPE_CHECKING, Iterator, Literal, Optional, Union
 
 from . import __version__
 
@@ -27,7 +29,7 @@ def create_server(root: Union[str, Path, None] = None) -> "FastMCP":
         ) from exc
 
     from .embeddings import create_embedder
-    from .store import MemoryStore
+    from .store import _DAMAGED_INDEX, MemoryStore, StoreIntegrityError, _damaged
     from .retrieval import HybridRetriever, VectorCache, default_threshold
 
     memory_root = Path(root or os.environ.get("MEMORYOS_HOME") or "./memory-data")
@@ -53,6 +55,18 @@ def create_server(root: Union[str, Path, None] = None) -> "FastMCP":
         readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
     )
 
+    @contextmanager
+    def opened() -> Iterator[MemoryStore]:
+        # Damage deep in the index shows up only when a query reads it; report
+        # it with the repair hint, as the CLI and HTTP API do.
+        try:
+            with MemoryStore(memory_root) as store:
+                yield store
+        except sqlite3.DatabaseError as error:
+            if not _damaged(error):
+                raise
+            raise StoreIntegrityError(_DAMAGED_INDEX.format(error)) from error
+
     @server.tool(annotations=read_only)
     def search(
         query: str,
@@ -63,7 +77,7 @@ def create_server(root: Union[str, Path, None] = None) -> "FastMCP":
         entity: Optional[str] = None,
     ) -> dict:
         """Search time-valid memories. Dates accept ISO timestamps or YYYY-MM-DD."""
-        with MemoryStore(memory_root) as store:
+        with opened() as store:
             matches = HybridRetriever(store, embedder=embedder, semantic_threshold=threshold,
                                       vector_cache=vectors).search(
                 query, as_of=as_of, known_at=known_at, limit=limit, mode=mode, entity=entity
@@ -86,7 +100,7 @@ def create_server(root: Union[str, Path, None] = None) -> "FastMCP":
     @server.tool(annotations=read_only)
     def fetch(id: str) -> dict:
         """Fetch a complete audit fact by ID, including provenance and dates."""
-        with MemoryStore(memory_root) as store:
+        with opened() as store:
             try:
                 fact = store.get(id)
             except KeyError:
@@ -104,7 +118,7 @@ def create_server(root: Union[str, Path, None] = None) -> "FastMCP":
         entity: str, attribute: Optional[str] = None, known_at: Optional[str] = None
     ) -> dict:
         """Return the effective timeline for an entity, optionally as known on a date."""
-        with MemoryStore(memory_root) as store:
+        with opened() as store:
             return {
                 "facts": [
                     fact.to_dict()

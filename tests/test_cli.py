@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import types
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -86,6 +87,18 @@ def test_empty_memoryos_home_uses_memory_data_in_the_working_directory(tmp_path,
     assert not (tmp_path / "memory").exists()
 
 
+def test_empty_root_option_is_treated_as_not_given(tmp_path, monkeypatch, capsys):
+    """An empty --root means the default folder, never the working directory itself."""
+    monkeypatch.chdir(tmp_path)
+    code, result, _ = run(capsys, "--root", "", "init")
+    assert code == 0
+    assert result["root"] == str((tmp_path / "memory-data").resolve())
+    assert not (tmp_path / "memory").exists() and not (tmp_path / ".memoryos").exists()
+    monkeypatch.setenv("MEMORYOS_HOME", str(tmp_path / "home"))
+    code, result, _ = run(capsys, "--root", "", "init")
+    assert (code, result["root"]) == (0, str((tmp_path / "home").resolve()))
+
+
 def test_missing_ids_are_reported_plainly(tmp_path, capsys):
     root = str(tmp_path)
     for command in (["correct", "0" * 32, "x"], ["retract", "0" * 32]):
@@ -125,6 +138,69 @@ def test_damaged_index_is_reported_by_every_command_and_repaired_by_reindex(tmp_
     assert re.fullmatch(r"index\.sqlite3\.corrupt-\d{8}T\d{6}", aside)
     code, history, _ = run(capsys, "--root", root, "history", "person")
     assert code == 0 and [fact["value"] for fact in history] == ["tea"]
+
+
+def damage_pages_holding(root, text):
+    """Overwrite the index pages that hold ``text``. The header and schema stay
+    intact, so the store opens and the damage shows only when a query reads them."""
+    index = root / ".memoryos" / "index.sqlite3"
+    with closing(sqlite3.connect(str(index))) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    raw = bytearray(index.read_bytes())
+    size = int.from_bytes(raw[16:18], "big")
+    pages = [start for start in range(size, len(raw), size)
+             if text.encode() in raw[start:start + size]]
+    assert pages
+    for start in pages:
+        raw[start:start + size] = b"\xab" * size
+    index.write_bytes(bytes(raw))
+
+
+def test_index_damage_found_by_a_query_is_reported_with_the_repair_hint(tmp_path, capsys):
+    """Damage that only a query reads gets the same message as damage found on opening."""
+    root = str(tmp_path)
+    assert run(capsys, "--root", root, "add", "person", "drink", "tea-marker")[0] == 0
+    damage_pages_holding(tmp_path, "tea-marker")
+    for command in (["init"], ["search", "tea"], ["history", "person"],
+                    ["add", "person", "city", "Riverton"]):
+        code, output, error = run(capsys, "--root", root, *command)
+        assert (code, output) == (1, None), command
+        message = error_of(error)
+        assert message.startswith("The index .memoryos/index.sqlite3 is damaged (")
+        assert "run `memoryos reindex`" in message and root not in message
+
+
+def replace_in_index(root, old, new):
+    """Replace the only copy of ``old`` in the index file; every page stays valid."""
+    index = root / ".memoryos" / "index.sqlite3"
+    with closing(sqlite3.connect(str(index))) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    raw = index.read_bytes()
+    assert raw.count(old) == 1
+    index.write_bytes(raw.replace(old, new))
+
+
+@pytest.mark.parametrize("old, new", [
+    (b" payload TEXT NOT NULL", b" payloax TEXT NOT NULL"),  # A column name in the schema.
+    (b'"value": "tea-marker"', b'"value"; "tea-marker"'),  # One record's stored JSON.
+], ids=["column name", "payload"])
+def test_index_damage_that_passes_the_page_check_gets_the_hint_and_reindex_repairs_it(
+        tmp_path, capsys, old, new):
+    root = str(tmp_path)
+    assert run(capsys, "--root", root, "add", "person", "drink", "tea-marker")[0] == 0
+    replace_in_index(tmp_path, old, new)
+    for command in (["init"], ["search", "tea"], ["history", "person"],
+                    ["add", "person", "drink", "coffee"]):
+        code, output, error = run(capsys, "--root", root, *command)
+        assert (code, output) == (1, None), command
+        message = error_of(error)
+        assert message.startswith("The index .memoryos/index.sqlite3 is damaged (")
+        assert "run `memoryos reindex`" in message and root not in message
+    for _ in range(2):  # The second run finds nothing left to repair.
+        code, result, error = run(capsys, "--root", root, "reindex")
+        assert (code, result) == (0, {"indexed": 1}), error
+    code, history, _ = run(capsys, "--root", root, "history", "person")
+    assert code == 0 and [fact["value"] for fact in history] == ["tea-marker"]
 
 
 def test_sqlite_and_import_errors_are_json_errors(tmp_path, capsys, monkeypatch):
@@ -185,6 +261,17 @@ def test_serve_on_all_interfaces_warns_without_a_token(tmp_path, capsys, monkeyp
     monkeypatch.delenv("MEMORYOS_ALLOWED_HOSTS")
     assert run(capsys, "--root", root, "serve")[2] == ""
     assert calls[1:] == [("0.0.0.0", 8000), ("127.0.0.1", 8000)]
+
+
+@pytest.mark.parametrize("port", ["70000", "-1", "65536"])
+def test_serve_rejects_a_port_outside_the_valid_range(tmp_path, capsys, monkeypatch, port):
+    """An impossible port is a JSON error, and no server is started."""
+    started = []
+    monkeypatch.setitem(sys.modules, "uvicorn", types.SimpleNamespace(
+        run=lambda *arguments, **options: started.append(options)))
+    code, output, error = run(capsys, "--root", str(tmp_path), "serve", "--port=" + port)
+    assert (code, output, started) == (1, None, [])
+    assert error_of(error) == "--port must be between 0 and 65535"
 
 
 def test_serve_without_the_api_extra_names_the_source_install(tmp_path, capsys, monkeypatch):

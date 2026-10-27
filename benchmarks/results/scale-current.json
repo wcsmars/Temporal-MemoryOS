@@ -1,20 +1,20 @@
 {
   "benchmark": "scale_latency_v2",
   "label": "current",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "package": {
-    "version": "0.2.2",
+    "version": "0.2.3",
     "location": "src/temporal_memory_os",
     "use_installed": false,
-    "source_sha256": "80bb85d5e353f759e0415ef9668bab504b29efd56f573bbd72ee82eedfbc3d40"
+    "source_sha256": "655b278c9101e4b28c07c8cbb934b69aa5f327b4f7b40cfd085078bc2708cfa3"
   },
-  "generated_at": "2026-10-24T17:50:28.880832+00:00",
+  "generated_at": "2026-10-27T09:07:08.031984+00:00",
   "environment": {
     "python": "3.11.7",
     "system": "Darwin",
     "machine": "arm64",
     "cpu_count": 12,
-    "load_average_1m_at_start": 4.19
+    "load_average_1m_at_start": 4.76
   },
   "parameters": {
     "sizes": [
@@ -46,39 +46,39 @@
   "results": [
     {
       "facts": 300,
-      "first_open_ms": 37.36,
-      "open_unchanged_ms": 1.228,
-      "full_rebuild_ms": 32.917,
-      "write_ms_median": 1.952,
-      "warm_search_ms_median": 1.733,
-      "cold_search_ms_median": 13.758
+      "first_open_ms": 39.157,
+      "open_unchanged_ms": 1.686,
+      "full_rebuild_ms": 31.737,
+      "write_ms_median": 1.83,
+      "warm_search_ms_median": 2.218,
+      "cold_search_ms_median": 14.231
     },
     {
       "facts": 1000,
-      "first_open_ms": 118.427,
-      "open_unchanged_ms": 3.673,
-      "full_rebuild_ms": 114.058,
-      "write_ms_median": 4.547,
-      "warm_search_ms_median": 4.972,
-      "cold_search_ms_median": 42.305
+      "first_open_ms": 126.692,
+      "open_unchanged_ms": 3.447,
+      "full_rebuild_ms": 117.226,
+      "write_ms_median": 4.005,
+      "warm_search_ms_median": 5.515,
+      "cold_search_ms_median": 45.192
     },
     {
       "facts": 3000,
-      "first_open_ms": 344.132,
-      "open_unchanged_ms": 10.443,
-      "full_rebuild_ms": 340.266,
-      "write_ms_median": 11.475,
-      "warm_search_ms_median": 16.011,
-      "cold_search_ms_median": 128.715
+      "first_open_ms": 366.257,
+      "open_unchanged_ms": 12.208,
+      "full_rebuild_ms": 339.952,
+      "write_ms_median": 10.484,
+      "warm_search_ms_median": 16.398,
+      "cold_search_ms_median": 136.105
     },
     {
       "facts": 10000,
-      "first_open_ms": 1172.316,
-      "open_unchanged_ms": 41.434,
-      "full_rebuild_ms": 1164.603,
-      "write_ms_median": 44.926,
-      "warm_search_ms_median": 57.387,
-      "cold_search_ms_median": 447.471
+      "first_open_ms": 1184.714,
+      "open_unchanged_ms": 38.665,
+      "full_rebuild_ms": 1262.158,
+      "write_ms_median": 45.761,
+      "warm_search_ms_median": 56.751,
+      "cold_search_ms_median": 461.026
     }
   ]
 }

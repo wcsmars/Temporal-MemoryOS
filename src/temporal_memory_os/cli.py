@@ -77,8 +77,13 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _execute(args: argparse.Namespace) -> Any:
-    root = Path(args.root).expanduser().resolve()
+    # An empty --root (say, from an unset shell variable) is treated as if it
+    # were not given, like an empty MEMORYOS_HOME: never the working directory.
+    location = args.root or os.environ.get("MEMORYOS_HOME") or "./memory-data"
+    root = Path(location).expanduser().resolve()
     if args.command == "serve":
+        if not 0 <= args.port <= 65535:
+            raise ValueError("--port must be between 0 and 65535")
         try:
             import uvicorn
             from .api import LOCAL_HOSTS, create_app
@@ -153,6 +158,16 @@ def _execute(args: argparse.Namespace) -> Any:
         raise ValueError(f"Unsupported command: {args.command}")
 
 
+def _message(error: Exception) -> str:
+    # Damage deep in the index shows up only when a command reads it; give the
+    # same repair hint as for damage found when the store opens.
+    if isinstance(error, sqlite3.DatabaseError):
+        from .store import _DAMAGED_INDEX, _damaged
+        if _damaged(error):
+            return _DAMAGED_INDEX.format(error)
+    return str(error)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -167,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"error": message}, ensure_ascii=False), file=sys.stderr)
         return 1
     except (ValueError, OSError, RuntimeError, ImportError, sqlite3.Error) as exc:
-        print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        print(json.dumps({"error": _message(exc)}, ensure_ascii=False), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130

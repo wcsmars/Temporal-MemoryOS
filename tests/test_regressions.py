@@ -17,6 +17,7 @@ import time
 import types
 import unicodedata
 from array import array
+from contextlib import closing
 from datetime import datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from fractions import Fraction
@@ -33,7 +34,7 @@ from temporal_memory_os import __version__, cli
 from temporal_memory_os.demo import DEMO_SOURCE, seed_demo
 from temporal_memory_os.embeddings import (STOPWORDS, EmbeddingUnavailableError, HashingEmbedder,
                                            SentenceTransformerEmbedder, create_embedder,
-                                           query_terms, tokenize)
+                                           tokenize)
 from temporal_memory_os.extraction import ProposalQueue
 from temporal_memory_os.models import normalize_time
 from temporal_memory_os.retrieval import MAX_KEYWORD_TERMS, HybridRetriever, VectorCache
@@ -265,10 +266,58 @@ def damage_pages(root):
     return damaged
 
 
+def damage_schema(root):
+    """Break the SQL of one index in the schema table, so SQLite cannot load the schema
+    ("malformed database schema")."""
+    index = Path(root) / ".memoryos" / "index.sqlite3"
+    with closing(sqlite3.connect(str(index))) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # Everything in the main file.
+    raw = index.read_bytes()
+    assert raw.count(b"CREATE INDEX facts_recorded") == 1
+    damaged = raw.replace(b"CREATE INDEX facts_recorded", b"CREATX INDEX facts_recorded")
+    index.write_bytes(damaged)
+    return damaged
+
+
+def damage_cell_text(root):
+    """Turn one byte of a stored file hash into invalid UTF-8; the page itself stays valid."""
+    index = Path(root) / ".memoryos" / "index.sqlite3"
+    with closing(sqlite3.connect(str(index))) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        [(digest,)] = connection.execute("SELECT sha256 FROM sources").fetchall()
+    raw = index.read_bytes()
+    assert raw.count(digest.encode()) == 1
+    index.write_bytes(raw.replace(digest.encode(), b"\xff" + digest.encode()[1:]))
+
+
+def damage_schema_text(root):
+    """Turn one byte of an index definition in the schema into invalid UTF-8."""
+    index = Path(root) / ".memoryos" / "index.sqlite3"
+    with closing(sqlite3.connect(str(index))) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    raw = index.read_bytes()
+    assert raw.count(b"CREATE INDEX facts_recorded") == 1
+    index.write_bytes(raw.replace(b"CREATE INDEX facts_recorded", b"CREAT\xff INDEX facts_recorded"))
+
+
+@pytest.mark.parametrize("damage", [damage_cell_text, damage_schema_text],
+                         ids=["cell", "schema"])
+def test_damage_that_leaves_unreadable_text_is_reported_and_repaired(tmp_path, damage):
+    with MemoryStore(tmp_path) as memory:
+        fact = memory.add("person", "drink", "tea", valid_from="2025-01-01")
+    damage(tmp_path)
+    with pytest.raises(StoreIntegrityError, match="memoryos reindex"):
+        MemoryStore(tmp_path)
+    with MemoryStore(tmp_path, repair_index=True) as repaired:
+        assert repaired.get(fact.id).value == "tea"
+    assert len(set_aside(tmp_path)) >= 1
+
+
 DAMAGE = pytest.mark.parametrize("damage, cause", [
     (damage_header, "file is not a database"),
     (damage_pages, "database disk image is malformed"),
-], ids=["header", "pages"])
+    (damage_schema, 'malformed database schema (facts_recorded) - near "CREATX": syntax error'),
+], ids=["header", "pages", "schema"])
 STAMPED = re.compile(r"index\.sqlite3(-wal|-shm)?\.corrupt-\d{8}T\d{6}")
 
 
@@ -305,6 +354,18 @@ def test_repair_index_sets_damaged_files_aside_with_a_timestamp(tmp_path, damage
         assert (tmp_path / ".memoryos" / aside).read_bytes() == damaged
     with MemoryStore(tmp_path) as memory:  # The rebuilt index is an ordinary one.
         assert [f.id for f in memory.all_facts()] == [fact.id]
+
+
+@pytest.mark.parametrize("code, damaged", [
+    (11, True), (26, True), (267, True), (779, True),  # Corruption, extended codes included.
+    (5, False), (8, False), (10, False), (13, False), (14, False), (None, False),
+])
+def test_sqlite_result_codes_decide_what_counts_as_damage(code, damaged):
+    """Corruption codes count as damage whatever SQLite's text says; other codes never do."""
+    error = sqlite3.DatabaseError("unexpected wording")
+    if code is not None:
+        error.sqlite_errorcode = code  # Set by Python 3.11 and later.
+    assert store_module._damaged(error) is damaged
 
 
 class DamagedConnection:
@@ -828,10 +889,7 @@ def test_tokenize_keeps_combining_marks_inside_words():
     assert tokenize(RESUME_NFD + " and coffee") == [RESUME_NFC.lower(), "and", "coffee"]
 
 
-def test_query_terms_drop_stopwords_unless_nothing_else_is_left():
-    assert query_terms("What is the preferred drink for Alex?") == ["preferred", "drink", "alex"]
-    assert query_terms("Where are the applications?") == ["application"]
-    assert query_terms("Who is it?") == ["who", "is", "it"]
+def test_common_question_words_are_stopwords():
     assert {"the", "for", "what", "is"} <= STOPWORDS
 
 
@@ -1099,21 +1157,21 @@ def test_hashing_embedders_of_different_sizes_do_not_share_vectors(store):
     assert len(swapped) == 2 and len(retriever.vectors) == 4  # Two documents per size.
 
 
-def test_a_batch_larger_than_the_cache_limit_is_not_cached(store):
+def test_a_batch_larger_than_the_cache_limit_keeps_its_last_entries(store):
     for name in ("alpha", "beta", "gamma"):
         store.add(name, "drink", "tea", valid_from="2025-01-01")
     retriever = HybridRetriever(store, HashingEmbedder())
     retriever.cache_limit = 2
     assert len(retriever.search("tea", mode="semantic")) == 3
-    assert len(retriever.vectors) == 0
-    retriever.search("tea", mode="semantic", entity="alpha")
-    assert len(retriever.vectors) == 1
-    retriever.search("tea", mode="semantic")
-    assert len(retriever.vectors) <= retriever.cache_limit
+    assert len(retriever.vectors) == retriever.cache_limit
+    assert len(retriever.search("tea", mode="semantic")) == 3
+    assert len(retriever.vectors) == retriever.cache_limit
     cache = VectorCache()
     entry = (2, None, array("d", [1.0, 0.0]), 1.0, frozenset({"tea"}))
     cache.store({("m", "a"): entry, ("m", "b"): entry, ("m", "c"): entry}, limit=2)
-    assert len(cache) == 0
+    assert len(cache) == 2
+    assert cache.get(("m", "a")) is None
+    assert cache.get(("m", "b")) is not None and cache.get(("m", "c")) is not None
 
 
 def test_storing_nothing_new_leaves_a_shared_cache_alone(store):
@@ -1201,11 +1259,11 @@ def test_default_threshold_validates_the_environment(monkeypatch, configured, ex
         assert retrieval_module.default_threshold() == expected
 
 
-def test_huge_embedding_values_are_rejected_instead_of_scoring_one(store):
+def test_huge_embedding_values_are_skipped_instead_of_scoring_one(store):
     store.add("person", "drink", "tea", valid_from="2025-01-01")
     huge = Controlled("huge", document=(1e200, 1e200))  # Finite, but the norm overflows.
-    with pytest.raises(ValueError, match="too large to compare"):
-        HybridRetriever(store, huge, semantic_threshold=0.9).search("zebra", mode="semantic")
+    retriever = HybridRetriever(store, huge, semantic_threshold=0.9)
+    assert retriever.search("zebra", mode="semantic") == []
 
 
 def test_keyword_channel_matches_documents_as_written(store):
@@ -1382,6 +1440,7 @@ def valid_proposal_file(store):
     (lambda data: json.dumps({**data, "confidence": "high"}).encode(), "field type"),
     (lambda data: json.dumps({**data, "confidence": True}).encode(), "field type"),
     (lambda data: json.dumps({**data, "dated": "no"}).encode(), "field type"),
+    (lambda data: json.dumps({**data, "observed": 1}).encode(), "field type"),
     (lambda data: json.dumps({**data, "warnings": "check this"}).encode(), "field type"),
     (lambda data: json.dumps({**data, "warnings": [1]}).encode(), "field type"),
     (lambda data: json.dumps({**data, "kind": "update"}).encode(), "field type"),
@@ -1393,7 +1452,7 @@ def valid_proposal_file(store):
         "bad-status", "bad-kind", "null-created-at", "bad-created-at", "compact-created-at",
         "compact-offset-created-at", "hour-only-created-at", "bad-valid-from",
         "number-entity", "list-target", "text-confidence", "boolean-confidence", "text-dated",
-        "text-warnings", "number-warning", "update-without-target", "correct-without-target",
+        "number-observed", "text-warnings", "number-warning", "update-without-target", "correct-without-target",
         "duplicate-without-target", "approved-without-result"])
 def test_malformed_proposal_file_is_named_and_skipped_by_list(store, damage, message):
     queue, proposal, path, data = valid_proposal_file(store)
@@ -1449,6 +1508,15 @@ def test_proposal_file_from_before_the_dated_field_still_loads(store):
     assert data.pop("dated") is False  # The line itself had no date.
     path.write_text(json.dumps(data), encoding="utf-8")
     assert queue.get(proposal.id).dated is True
+    assert queue.approve(proposal.id).value == "Riverton"
+
+
+def test_proposal_file_from_before_the_observed_field_still_loads(store):
+    """A proposal file written before the observed field loads as not observed."""
+    queue, proposal, path, data = valid_proposal_file(store)
+    assert data.pop("observed") is True  # The line took an explicit observation time.
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert queue.get(proposal.id).observed is False
     assert queue.approve(proposal.id).value == "Riverton"
 
 
@@ -1887,7 +1955,7 @@ def test_an_unchanged_open_marks_recent_files_verified_when_the_lock_is_free(tmp
     index = tmp_path / ".memoryos" / "index.sqlite3"
 
     def verified():
-        with sqlite3.connect(index) as connection:
+        with closing(sqlite3.connect(index)) as connection:
             return connection.execute("SELECT verified_ns FROM sources").fetchone()[0]
 
     before = verified()
@@ -2260,8 +2328,9 @@ def test_in_order_approval_accepts_a_line_restating_the_conversations_last_value
                                       "user | city | London | 2026-02-01", source="chat")
     assert (january.kind, february.kind) == ("add", "add")
     first = queue.approve(january.id)
-    assert queue.approve(february.id).id == first.id  # Confirms the value; nothing new.
-    assert [fact.value for fact in store.history("user", "city")] == ["London"]
+    again = queue.approve(february.id)  # Confirms the value, recorded at its own date.
+    assert again.id != first.id and again.valid_from == "2026-02-01T00:00:00.000000Z"
+    assert [fact.value for fact in store.history("user", "city")] == ["London", "London"]
 
 
 def test_in_order_approval_accepts_a_repeated_update(store):
@@ -2271,8 +2340,9 @@ def test_in_order_approval_accepts_a_repeated_update(store):
                                     "user | city | Oslo | 2026-03-01", source="chat")
     assert (february.kind, march.kind) == ("update", "update")
     oslo = queue.approve(february.id)
-    assert queue.approve(march.id).id == oslo.id
-    assert [fact.value for fact in store.history("user", "city")] == ["London", "Oslo"]
+    again = queue.approve(march.id)
+    assert again.id != oslo.id and again.valid_from == "2026-03-01T00:00:00.000000Z"
+    assert [fact.value for fact in store.history("user", "city")] == ["London", "Oslo", "Oslo"]
 
 
 def test_in_order_approval_records_a_return_to_an_earlier_value(store):
@@ -2296,9 +2366,10 @@ def test_a_same_time_restatement_from_the_same_text_is_still_a_sibling_conflict(
         queue.approve(again.id)
 
 
-def test_finite_vectors_whose_norm_overflows_are_a_value_error(store):
+def test_finite_vectors_whose_norm_overflows_are_not_compared(store):
     store.add("person", "drink", "tea", valid_from="2025-01-01")
-    for document, query in (([1e154, 1e154], (1.0, 0.0)), ([1.0, 0.0], (1e154, 1e154))):
-        provider = Controlled("huge", document, query)
-        with pytest.raises(ValueError, match="too large to compare"):
-            HybridRetriever(store, provider).search("tea", mode="semantic")
+    document = Controlled("huge", [1e154, 1e154], (1.0, 0.0))
+    assert HybridRetriever(store, document).search("tea", mode="semantic") == []
+    query = Controlled("huge", [1.0, 0.0], (1e154, 1e154))
+    with pytest.raises(EmbeddingUnavailableError, match="too large to compare"):
+        HybridRetriever(store, query).search("tea", mode="semantic")

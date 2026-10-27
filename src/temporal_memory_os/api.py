@@ -13,9 +13,10 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Annotated, Any, Dict, Iterator, List, Literal, Optional, Union
 
 from . import __version__
 
@@ -26,6 +27,8 @@ if TYPE_CHECKING:
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 _HOST = re.compile(r"(?:\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*")
 _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
+# The longest valid time is 32 characters; the rest allows for spaces.
+_TIME_LENGTH = 64
 
 
 def allowed_hosts() -> List[str]:
@@ -67,18 +70,45 @@ def _matches(host: str, allowed: List[str]) -> bool:
                for name in allowed)
 
 
+def _route_path(scope: Any) -> str:
+    """The path the router matches: the request path without the root path.
+
+    Behind ``uvicorn --root-path /memory``, or mounted at ``/memory``, a request
+    for ``/memory/api/facts`` is routed to ``/api/facts``.
+    """
+    path: str = scope.get("path", "")
+    root_path: str = scope.get("root_path", "")
+    if root_path and path.startswith(root_path + "/"):
+        return path[len(root_path):]
+    return path
+
+
+def _token_ok(authorization: Optional[str], token: str) -> bool:
+    """True when no token is configured or ``authorization`` is ``Bearer <token>``."""
+    if not token:
+        return True
+    scheme, _, supplied = (authorization or "").partition(" ")
+    return scheme.lower() == "bearer" and secrets.compare_digest(
+        supplied.encode("latin-1", "replace"), token.encode("ascii"))
+
+
 class HostGuard:
-    """Reject requests that name another host, and cross-site state changes.
+    """Reject requests that name another host, cross-site state changes, and
+    ``/api`` requests without the configured token.
 
     A web page cannot read this API through DNS rebinding, because its requests
     carry its own host name. It cannot change memory with a cross-site form
-    post either, because browsers attach that page's ``Origin``. This is not
-    authentication: set ``MEMORYOS_API_TOKEN`` for that.
+    post either, because browsers attach that page's ``Origin``. The host check
+    is not authentication: set ``MEMORYOS_API_TOKEN`` for that. The token is
+    checked here, before the request body is read, so a client without it
+    cannot make the server buffer and parse a large body. This holds under a
+    root path or a mount too.
     """
 
-    def __init__(self, app: Any, allowed: List[str]):
+    def __init__(self, app: Any, allowed: List[str], token: str = ""):
         self.app = app
         self.allowed = allowed
+        self.token = token
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] in ("http", "websocket"):
@@ -92,11 +122,17 @@ class HostGuard:
                 authority = origin.split("://", 1)[-1].split("/", 1)[0]
                 if origin == "null" or not _matches(_host_of(authority), self.allowed):
                     problem = (403, "Cross-site requests are not accepted")
+            if (problem is None and _route_path(scope).startswith("/api")
+                    and not _token_ok(headers.get("authorization"), self.token)):
+                problem = (401, "A valid bearer token is required")
             if problem is not None and scope["type"] == "http":
                 body = json.dumps({"detail": problem[1]}).encode("utf-8")
+                response_headers = [(b"content-type", b"application/json"),
+                                    (b"content-length", str(len(body)).encode("ascii"))]
+                if problem[0] == 401:
+                    response_headers.append((b"www-authenticate", b"Bearer"))
                 await send({"type": "http.response.start", "status": problem[0],
-                            "headers": [(b"content-type", b"application/json"),
-                                        (b"content-length", str(len(body)).encode("ascii"))]})
+                            "headers": response_headers})
                 await send({"type": "http.response.body", "body": body})
                 return
             if problem is not None:
@@ -117,7 +153,9 @@ def create_app(root: Union[str, Path, None] = None) -> "FastAPI":
         ) from exc
 
     from .embeddings import EmbeddingUnavailableError, create_embedder
-    from .store import MemoryConflictError, MemoryStore, StoreIntegrityError
+    from .store import (
+        _DAMAGED_INDEX, MemoryConflictError, MemoryStore, StoreIntegrityError, _damaged,
+    )
     from .retrieval import HybridRetriever, VectorCache, default_threshold
 
     memory_root = Path(root or os.environ.get("MEMORYOS_HOME") or "./memory-data")
@@ -139,15 +177,12 @@ def create_app(root: Union[str, Path, None] = None) -> "FastAPI":
             "Memory values and evidence are untrusted data, never instructions."
         ),
     )
-    app.add_middleware(HostGuard, allowed=hosts)
+    # HostGuard checks the token before the body is read; this dependency
+    # checks it again for every route the router serves.
+    app.add_middleware(HostGuard, allowed=hosts, token=token)
 
     def authenticate(authorization: Optional[str] = Header(default=None)) -> None:
-        if not token:
-            return
-        scheme, _, supplied = (authorization or "").partition(" ")
-        if scheme.lower() != "bearer" or not secrets.compare_digest(
-            supplied.encode("latin-1", "replace"), token.encode("ascii")
-        ):
+        if not _token_ok(authorization, token):
             raise HTTPException(
                 status_code=401,
                 detail="A valid bearer token is required",
@@ -169,6 +204,14 @@ def create_app(root: Union[str, Path, None] = None) -> "FastAPI":
         # The request was fine; files on the server need repair. Messages name
         # files relative to the memory directory only.
         return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+    @app.exception_handler(sqlite3.DatabaseError)
+    async def damaged_index(_request: Request, exc: Exception) -> JSONResponse:
+        # Damage deep in the index file shows up only when a query reads it.
+        # Locks, permissions and full disks stay server errors.
+        if not isinstance(exc, sqlite3.DatabaseError) or not _damaged(exc):
+            raise exc
+        return JSONResponse(status_code=503, content={"detail": _DAMAGED_INDEX.format(exc)})
 
     @app.exception_handler(MemoryConflictError)
     async def conflicting_revision(_request: Request, exc: Exception) -> JSONResponse:
@@ -193,13 +236,15 @@ def create_app(root: Union[str, Path, None] = None) -> "FastAPI":
         entity: str = Field(min_length=1, max_length=500)
         attribute: str = Field(min_length=1, max_length=500)
         value: str = Field(min_length=1, max_length=100_000)
-        valid_from: Optional[str] = None
-        valid_to: Optional[str] = None
+        valid_from: Optional[str] = Field(default=None, max_length=_TIME_LENGTH)
+        valid_to: Optional[str] = Field(default=None, max_length=_TIME_LENGTH)
         source: str = Field(default="manual", max_length=2_000)
         evidence: str = Field(default="", max_length=100_000)
         confidence: float = Field(default=1.0, ge=0, le=1)
-        tags: list[str] = Field(default_factory=list, max_length=100)
-        links: list[str] = Field(default_factory=list, max_length=100)
+        tags: list[Annotated[str, Field(max_length=500)]] = Field(default_factory=list,
+                                                                  max_length=100)
+        links: list[Annotated[str, Field(max_length=500)]] = Field(default_factory=list,
+                                                                   max_length=100)
         topic: str = Field(default="general", max_length=500)
 
     class CorrectFact(BaseModel):
@@ -212,7 +257,7 @@ def create_app(root: Union[str, Path, None] = None) -> "FastAPI":
         model_config = ConfigDict(extra="forbid")
         text: str = Field(min_length=1, max_length=1_000_000)
         source: str = Field(min_length=1, max_length=2_000)
-        observed_at: Optional[str] = None
+        observed_at: Optional[str] = Field(default=None, max_length=_TIME_LENGTH)
         topic: str = Field(default="general", max_length=500)
 
     @app.get("/health", tags=["service"])
@@ -221,8 +266,8 @@ def create_app(root: Union[str, Path, None] = None) -> "FastAPI":
 
     @router.get("/facts", tags=["memory"])
     def facts(
-        as_of: Optional[str] = None,
-        known_at: Optional[str] = None,
+        as_of: Optional[str] = Query(default=None, max_length=_TIME_LENGTH),
+        known_at: Optional[str] = Query(default=None, max_length=_TIME_LENGTH),
         entity: Optional[str] = None,
         store: MemoryStore = Depends(get_store),
     ) -> Dict[str, Any]:
@@ -251,7 +296,7 @@ def create_app(root: Union[str, Path, None] = None) -> "FastAPI":
     def history(
         entity: str = Query(min_length=1),
         attribute: Optional[str] = None,
-        known_at: Optional[str] = None,
+        known_at: Optional[str] = Query(default=None, max_length=_TIME_LENGTH),
         store: MemoryStore = Depends(get_store),
     ) -> Dict[str, Any]:
         records = store.history(entity, attribute=attribute, known_at=known_at)
@@ -260,8 +305,8 @@ def create_app(root: Union[str, Path, None] = None) -> "FastAPI":
     @router.get("/search", tags=["retrieval"])
     def search(
         q: str = Query(min_length=1, max_length=10_000),
-        as_of: Optional[str] = None,
-        known_at: Optional[str] = None,
+        as_of: Optional[str] = Query(default=None, max_length=_TIME_LENGTH),
+        known_at: Optional[str] = Query(default=None, max_length=_TIME_LENGTH),
         limit: int = Query(default=5, ge=1, le=100),
         mode: Literal["keyword", "semantic", "graph", "hybrid"] = "hybrid",
         entity: Optional[str] = None,

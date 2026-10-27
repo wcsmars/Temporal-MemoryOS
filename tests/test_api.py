@@ -7,6 +7,7 @@ token, the default allowed hosts and the dependency-free embedder.
 import sqlite3
 import sys
 import types
+from contextlib import closing
 
 import pytest
 
@@ -14,6 +15,8 @@ pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient  # noqa: E402
+from starlette.applications import Starlette  # noqa: E402
+from starlette.routing import Mount  # noqa: E402
 
 from temporal_memory_os.api import create_app  # noqa: E402
 
@@ -83,6 +86,110 @@ def test_api_bearer_auth_protects_reads_and_writes(tmp_path, monkeypatch):
             "/api/facts", headers={"Authorization": "Bearer local-test-token"}
         )
         assert allowed.status_code == 200
+
+
+def recording_bodies(app):
+    """``app`` wrapped to record each request body message it reads, and that record."""
+    bodies = []
+
+    async def recording(scope, receive, send):
+        async def tracked():
+            message = await receive()
+            if message["type"] == "http.request":
+                bodies.append(message)
+            return message
+
+        await app(scope, tracked, send)
+
+    return recording, bodies
+
+
+def test_requests_without_the_token_are_refused_before_the_body_is_read(tmp_path, monkeypatch):
+    """Without the token, a write gets 401 and the server never reads its body."""
+    monkeypatch.setenv("MEMORYOS_API_TOKEN", "local-test-token")
+    recording, bodies = recording_bodies(create_app(tmp_path))
+    routes = ("/api/facts", "/api/facts/{}/corrections".format("0" * 32), "/api/proposals/extract")
+    json_type = {"Content-Type": "application/json"}
+    with TestClient(recording, base_url="http://localhost") as secured:
+        for authorization in ({}, {"Authorization": "Bearer wrong"},
+                              {"Authorization": "Basic local-test-token"}):
+            for route in routes:
+                response = secured.post(route, content=b"{not json",
+                                        headers={**json_type, **authorization})
+                assert response.status_code == 401, (route, authorization)
+                assert response.json() == {"detail": "A valid bearer token is required"}
+                assert response.headers["www-authenticate"] == "Bearer"
+        assert bodies == []
+        # With the token the body is read and validated as before.
+        allowed = secured.post("/api/facts", content=b"{not json", headers={
+            **json_type, "Authorization": "Bearer local-test-token"})
+        assert allowed.status_code == 422 and bodies
+
+
+@pytest.mark.parametrize("mounted", [False, True], ids=["root path", "mount"])
+def test_the_token_is_checked_before_the_body_is_read_under_a_path_prefix(tmp_path, monkeypatch,
+                                                                          mounted):
+    """Behind ``uvicorn --root-path /memory``, or mounted at /memory, a write
+    without the token still gets 401 before its body is read."""
+    monkeypatch.setenv("MEMORYOS_API_TOKEN", "local-test-token")
+    recording, bodies = recording_bodies(create_app(tmp_path))
+    if mounted:
+        served, options = Starlette(routes=[Mount("/memory", app=recording)]), {}
+    else:
+        served, options = recording, {"root_path": "/memory"}
+    json_type = {"Content-Type": "application/json"}
+    with TestClient(served, base_url="http://localhost", **options) as secured:
+        refused = secured.post("/memory/api/facts", content=b"{not json", headers=json_type)
+        assert refused.status_code == 401
+        assert refused.json() == {"detail": "A valid bearer token is required"}
+        assert refused.headers["www-authenticate"] == "Bearer"
+        assert bodies == []
+        assert secured.get("/memory/health").status_code == 200
+        allowed = secured.post("/memory/api/facts", content=b"{not json", headers={
+            **json_type, "Authorization": "Bearer local-test-token"})
+        assert allowed.status_code == 422 and bodies
+
+
+def test_tags_links_and_times_have_length_limits(client):
+    """Each tag and link holds at most 500 characters, and each time string at most 64."""
+    fact = {"entity": "Acme", "attribute": "status", "value": "open"}
+    # Spaces around a time are allowed; each of these is exactly 64 characters.
+    padded, later = "2026-01-01" + " " * 54, " " * 54 + "2026-02-01"
+    accepted = client.post("/api/facts", json={**fact, "tags": ["t" * 500], "links": ["l" * 500],
+                                               "valid_from": padded, "valid_to": later})
+    assert accepted.status_code == 201, accepted.text
+    for field, value, location in (("tags", ["t" * 501], ["body", "tags", 0]),
+                                   ("links", ["ok", "l" * 501], ["body", "links", 1]),
+                                   ("valid_from", padded + " ", ["body", "valid_from"]),
+                                   ("valid_to", padded + " ", ["body", "valid_to"])):
+        response = client.post("/api/facts", json={**fact, field: value})
+        assert response.status_code == 422, field
+        [error] = response.json()["detail"]
+        assert (error["type"], error["loc"]) == ("string_too_long", location)
+    extract = client.post("/api/proposals/extract", json={
+        "text": "Acme | status | open", "source": "chat", "observed_at": padded + " "})
+    assert extract.status_code == 422
+    [error] = extract.json()["detail"]
+    assert (error["type"], error["loc"]) == ("string_too_long", ["body", "observed_at"])
+    stored = client.get("/api/facts", params={"as_of": "2026-01-15"}).json()["facts"]
+    assert [fact["id"] for fact in stored] == [accepted.json()["id"]]
+
+
+@pytest.mark.parametrize("route, params, name", [
+    ("/api/facts", {}, "as_of"),
+    ("/api/facts", {}, "known_at"),
+    ("/api/search", {"q": "Acme"}, "as_of"),
+    ("/api/search", {"q": "Acme"}, "known_at"),
+    ("/api/history", {"entity": "Acme"}, "known_at"),
+])
+def test_time_query_parameters_have_the_body_length_limit(client, route, params, name):
+    """A time in a query string, like one in a request body, holds at most 64 characters."""
+    padded = "2026-01-01" + " " * 54
+    assert client.get(route, params={**params, name: padded}).status_code == 200
+    response = client.get(route, params={**params, name: padded + " "})
+    assert response.status_code == 422
+    [error] = response.json()["detail"]
+    assert (error["type"], error["loc"]) == ("string_too_long", ["query", name])
 
 
 def test_api_validation_and_missing_record(client):
@@ -347,6 +454,87 @@ def test_damaged_index_returns_503_and_only_the_cli_repairs_it(tmp_path, client)
         assert "run `memoryos reindex`" in detail and str(tmp_path) not in detail
     # The server never renames files that other requests may have open.
     assert sorted(p.name for p in (tmp_path / ".memoryos").iterdir()) == ["index.sqlite3"]
+
+
+def damage_pages_holding(root, text):
+    """Overwrite the index pages that hold ``text``. The header and schema stay
+    intact, so the store opens and the damage shows only when a query reads them."""
+    index = root / ".memoryos" / "index.sqlite3"
+    with closing(sqlite3.connect(str(index))) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    raw = bytearray(index.read_bytes())
+    size = int.from_bytes(raw[16:18], "big")
+    pages = [start for start in range(size, len(raw), size)
+             if text.encode() in raw[start:start + size]]
+    assert pages
+    for start in pages:
+        raw[start:start + size] = b"\xab" * size
+    index.write_bytes(bytes(raw))
+
+
+def test_index_damage_found_by_a_query_returns_503_with_the_repair_hint(tmp_path, client,
+                                                                        monkeypatch):
+    """Damage that only a query reads gets the same 503 as damage found on opening."""
+    fact = add(client, "pending-marker")
+    damage_pages_holding(tmp_path, "pending-marker")
+    for response in (client.get("/api/facts"), client.get("/api/facts/" + fact["id"]),
+                     client.get("/api/search", params={"q": "status"}),
+                     client.get("/api/history", params={"entity": "Acme application"}),
+                     client.post("/api/facts", json={"entity": "Acme application",
+                                                     "attribute": "status", "value": "x"}),
+                     client.post("/api/reindex")):
+        assert response.status_code == 503, response.text
+        detail = response.json()["detail"]
+        assert detail.startswith("The index .memoryos/index.sqlite3 is damaged (")
+        assert "run `memoryos reindex`" in detail and str(tmp_path) not in detail
+    assert sorted(p.name for p in (tmp_path / ".memoryos").iterdir()) == ["index.sqlite3"]
+    from temporal_memory_os.store import MemoryStore
+
+    def locked(self, **_arguments):
+        raise sqlite3.OperationalError("database is locked")
+
+    # Other database errors are not damage and stay server errors.
+    monkeypatch.setattr(MemoryStore, "snapshot", locked)
+    with TestClient(create_app(tmp_path), base_url="http://localhost",
+                    raise_server_exceptions=False) as test_client:
+        response = test_client.get("/api/facts")
+        assert response.status_code == 500 and "reindex" not in response.text
+
+
+def replace_in_index(root, old, new):
+    """Replace the only copy of ``old`` in the index file; every page stays valid."""
+    index = root / ".memoryos" / "index.sqlite3"
+    with closing(sqlite3.connect(str(index))) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    raw = index.read_bytes()
+    assert raw.count(old) == 1
+    index.write_bytes(raw.replace(old, new))
+
+
+@pytest.mark.parametrize("old, new, rebuilt", [
+    # A column name in the schema: only the CLI may set the damaged file aside.
+    (b" payload TEXT NOT NULL", b" payloax TEXT NOT NULL", False),
+    # One record's stored JSON, still valid UTF-8: rebuilding in place replaces it.
+    (b'"value": "pending-marker"', b'"value"; "pending-marker"', True),
+], ids=["column name", "payload"])
+def test_index_damage_that_passes_the_page_check_returns_503_not_422_or_500(tmp_path, client,
+                                                                           old, new, rebuilt):
+    fact = add(client, "pending-marker")
+    replace_in_index(tmp_path, old, new)
+    for response in (client.get("/api/facts"), client.get("/api/facts/" + fact["id"]),
+                     client.get("/api/search", params={"q": "status"}),
+                     client.get("/api/history", params={"entity": "Acme application"}),
+                     client.post("/api/facts", json={"entity": "Acme application",
+                                                     "attribute": "status", "value": "x"})):
+        assert response.status_code == 503, response.text
+        detail = response.json()["detail"]
+        assert detail.startswith("The index .memoryos/index.sqlite3 is damaged (")
+        assert "run `memoryos reindex`" in detail and str(tmp_path) not in detail
+    response = client.post("/api/reindex")
+    assert response.status_code == (200 if rebuilt else 503), response.text
+    assert sorted(p.name for p in (tmp_path / ".memoryos").iterdir()) == ["index.sqlite3"]
+    if rebuilt:
+        assert client.get("/api/facts/" + fact["id"]).json()["value"] == "pending-marker"
 
 
 def test_proposal_listing_names_damaged_files_and_lists_the_rest(tmp_path, client):

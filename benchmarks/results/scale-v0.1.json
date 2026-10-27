@@ -8,13 +8,13 @@
     "use_installed": true,
     "source_sha256": "8ec0113fa0e38e07215138fb5adeb0dd3047e0c0329a3737e26c80bcf55ab815"
   },
-  "generated_at": "2026-10-24T17:49:20.280125+00:00",
+  "generated_at": "2026-10-27T09:05:58.634223+00:00",
   "environment": {
     "python": "3.11.7",
     "system": "Darwin",
     "machine": "arm64",
     "cpu_count": 12,
-    "load_average_1m_at_start": 3.94
+    "load_average_1m_at_start": 4.67
   },
   "parameters": {
     "sizes": [
@@ -46,39 +46,39 @@
   "results": [
     {
       "facts": 300,
-      "first_open_ms": 40.041,
-      "open_unchanged_ms": 35.678,
-      "full_rebuild_ms": 37.633,
-      "write_ms_median": 37.706,
-      "warm_search_ms_median": 14.575,
-      "cold_search_ms_median": 55.843
+      "first_open_ms": 39.118,
+      "open_unchanged_ms": 36.648,
+      "full_rebuild_ms": 35.457,
+      "write_ms_median": 39.081,
+      "warm_search_ms_median": 13.759,
+      "cold_search_ms_median": 59.701
     },
     {
       "facts": 1000,
-      "first_open_ms": 120.187,
-      "open_unchanged_ms": 121.842,
-      "full_rebuild_ms": 119.171,
-      "write_ms_median": 123.768,
-      "warm_search_ms_median": 47.321,
-      "cold_search_ms_median": 174.603
+      "first_open_ms": 114.374,
+      "open_unchanged_ms": 128.101,
+      "full_rebuild_ms": 134.443,
+      "write_ms_median": 136.804,
+      "warm_search_ms_median": 50.4,
+      "cold_search_ms_median": 190.877
     },
     {
       "facts": 3000,
-      "first_open_ms": 366.489,
-      "open_unchanged_ms": 381.654,
-      "full_rebuild_ms": 376.269,
-      "write_ms_median": 377.46,
-      "warm_search_ms_median": 144.662,
-      "cold_search_ms_median": 535.964
+      "first_open_ms": 409.466,
+      "open_unchanged_ms": 383.615,
+      "full_rebuild_ms": 382.145,
+      "write_ms_median": 385.791,
+      "warm_search_ms_median": 151.736,
+      "cold_search_ms_median": 551.7
     },
     {
       "facts": 10000,
-      "first_open_ms": 1261.671,
-      "open_unchanged_ms": 1303.89,
-      "full_rebuild_ms": 1273.286,
-      "write_ms_median": 1286.015,
-      "warm_search_ms_median": 496.436,
-      "cold_search_ms_median": 1779.898
+      "first_open_ms": 1267.655,
+      "open_unchanged_ms": 1400.003,
+      "full_rebuild_ms": 1415.745,
+      "write_ms_median": 1366.662,
+      "warm_search_ms_median": 519.86,
+      "cold_search_ms_median": 1923.519
     }
   ]
 }

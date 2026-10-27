@@ -44,6 +44,11 @@ _COLUMNS = (
     "id", "entity", "attribute", "value", "valid_from", "valid_to", "recorded_at",
     "source", "evidence", "confidence", "tags", "links", "topic", "supersedes", "deleted",
 )
+# Every column of the engine's tables, in schema order (see _initialize).
+_TABLE_COLUMNS = {
+    "facts": _COLUMNS + ("path", "payload"),
+    "sources": ("path", "size", "mtime_ns", "sha256", "verified_ns"),
+}
 
 
 def _bounded(fact: Fact, end: Optional[str]) -> Fact:
@@ -106,10 +111,38 @@ def _locked(error: sqlite3.Error) -> bool:
     return isinstance(error, sqlite3.OperationalError) and ("locked" in text or "busy" in text)
 
 
-def _damaged(error: sqlite3.Error) -> bool:
-    """True only for SQLite's corruption errors, never for locks, permissions or full disks."""
+def _missing_column(error: sqlite3.Error) -> bool:
+    """True when SQLite reports that a statement names a column the table does not have.
+
+    Only SQLite's own wording counts, at the start of the message: a damage report that
+    merely quotes such text (a table named that way, say) is still damage.
+    """
     text = str(error).lower()
-    return "file is not a database" in text or "disk image is malformed" in text
+    return (text.startswith("no such column: ")
+            or text.startswith("table ") and " has no column named " in text)
+
+
+def _damaged(error: sqlite3.Error) -> bool:
+    """True only for SQLite's corruption errors, never for locks, permissions or full disks.
+
+    A damaged schema page reads as "malformed database schema". Python 3.11 and later also
+    give the result code: SQLITE_CORRUPT (11) or SQLITE_NOTADB (26), with or without an
+    extended code. A damaged column name still parses; it shows only when a query names
+    the column, as a missing column.
+    """
+    code = getattr(error, "sqlite_errorcode", None)
+    if isinstance(code, int) and code & 0xFF in (11, 26):
+        return True
+    text = str(error).lower()
+    if type(error) is sqlite3.DatabaseError and not text:
+        return True  # Python 3.10: SQLite's message quoted damaged bytes it could not decode.
+    return ("file is not a database" in text or "disk image is malformed" in text
+            or "malformed database schema" in text
+            # Text the engine wrote is always UTF-8; anything else is a damaged cell.
+            or "could not decode to utf-8" in text
+            # Queries name only columns the engine created (a new layout gets a new
+            # schema version), so in an open index a missing one is a damaged name.
+            or _missing_column(error))
 
 
 _DAMAGED_INDEX = ("The index .memoryos/index.sqlite3 is damaged ({}). Stop other programs using "
@@ -142,13 +175,14 @@ class MemoryStore:
         self.root = Path(root).expanduser().resolve()
         self.memory_dir = self.root / "memory"
         self.state_dir = self.root / ".memoryos"
+        # The folders on disk need attention, not the caller's request.
         if self.memory_dir.is_symlink() or self.state_dir.is_symlink():
-            raise ValueError("Memory and index folders must not be symbolic links")
+            raise StoreIntegrityError("Memory and index folders must not be symbolic links")
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.state_dir / "index.sqlite3"
         if any(Path(str(self.db_path) + suffix).is_symlink() for suffix in ("", "-wal", "-shm")):
-            raise ValueError("The index database must not be a symbolic link")
+            raise StoreIntegrityError("The index database must not be a symbolic link")
         self._lock = threading.RLock()
         # Parsed records keyed by ID. The stored payload is compared on every
         # hit, so a rebuild by another process can never serve a stale record.
@@ -219,14 +253,38 @@ class MemoryStore:
                 connection.execute("PRAGMA busy_timeout = {}".format(int(_LOCK_RETRY_SECONDS * 1000)))
                 connection.execute("PRAGMA journal_mode = WAL")
                 self._initialize(connection)
+                if repair:
+                    # Damage in a page that opening and refresh never read (a record
+                    # or a secondary index) would otherwise fail the rebuild itself.
+                    problems = [row[0] for row in connection.execute("PRAGMA quick_check")]
+                    if problems != ["ok"]:
+                        raise sqlite3.DatabaseError(
+                            "database disk image is malformed ({})".format(problems[0]))
+                    # A damaged column name in the schema still parses, so quick_check
+                    # accepts it; every query that names the column then fails.
+                    for table, columns in _TABLE_COLUMNS.items():
+                        # Fetched at once, so a name that cannot be decoded leaves no
+                        # statement open when the connection is closed below.
+                        rows = connection.execute("PRAGMA table_info({})".format(table)).fetchall()
+                        found = tuple(row[1] for row in rows)
+                        if found != columns:
+                            raise sqlite3.DatabaseError(
+                                "database disk image is malformed (columns of {})".format(table))
                 return connection
-            except sqlite3.DatabaseError as error:
+            except (sqlite3.DatabaseError, UnicodeDecodeError) as raised:
                 connection.close()
+                # Python 3.11+: SQLite's message quoted damaged schema bytes, so even the
+                # error could not be decoded. Only the index file is read here.
+                error = (sqlite3.DatabaseError("malformed database schema (unreadable text)")
+                         if isinstance(raised, UnicodeDecodeError) else raised)
                 if _locked(error) and time.monotonic() < deadline:
                     time.sleep(0.05)  # Another process is creating the schema.
                     continue
-                if not _damaged(error):
-                    raise  # Locks, permissions, full disks: never a reason to discard data.
+                # Locks, permissions, full disks: never a reason to discard data. Nor is a
+                # missing column here: only the upgrade of an older index names columns,
+                # so that table layout was never written by this release.
+                if not _damaged(error) or _missing_column(error):
+                    raise
                 if not repair or repaired:
                     raise StoreIntegrityError(_DAMAGED_INDEX.format(error)) from error
                 repaired = True
@@ -590,7 +648,13 @@ class MemoryStore:
         cached = self._parsed.get(row["id"])
         if cached is not None and cached[0] == payload:
             return cached[1]
-        fact = Fact.from_dict(json.loads(payload))
+        try:
+            fact = Fact.from_dict(json.loads(payload))
+        except (ValueError, TypeError, RecursionError) as error:
+            # The engine stored a valid record here, so the index cell was damaged
+            # (SQLite does not checksum cell contents); the request was fine.
+            raise StoreIntegrityError(_DAMAGED_INDEX.format(
+                "record {} cannot be read: {}".format(row["id"], error))) from error
         if len(self._parsed) >= 200_000:
             self._parsed.clear()
         self._parsed[row["id"]] = (payload, fact)
@@ -600,6 +664,48 @@ class MemoryStore:
         row = self.connection.execute("SELECT id, payload FROM facts WHERE id = ?",
                                       (fact_id,)).fetchone()
         return None if row is None else self._fact(row)
+
+    def _check_topic_spelling(self, topic: str) -> None:
+        """Refuse a topic whose folder exists only in another letter case.
+
+        A case-insensitive file system (the macOS default) would put the record in
+        the existing folder while the index kept the given spelling, so every later
+        refresh would rebuild and an emptied record there would go unreported.
+        """
+        folder = self.memory_dir
+        segments = topic.split("/")
+        for depth, segment in enumerate(segments):
+            if not (folder / segment).exists():
+                return  # Created below with the given spelling.
+            names = os.listdir(folder)  # The real letter case, unlike exists().
+            if segment not in names:
+                same = [name for name in names if name.casefold() == segment.casefold()]
+                existing = " as {!r}".format("/".join(segments[:depth] + same[:1])) if same else ""
+                raise ValueError("Topic folder {!r} already exists{} in another letter case; use "
+                                 "the existing spelling".format(
+                                     "/".join(segments[:depth + 1]), existing))
+            folder = folder / segment
+
+    def existing_topic(self, topic: str) -> str:
+        """``topic`` spelled like the topic folders that already exist on disk.
+
+        On a case-insensitive disk, "work" names an existing "Work" folder, so a
+        record for it belongs there under that spelling. From the first segment
+        without such a folder on, the given spelling is kept.
+        """
+        folder, segments = self.memory_dir, topic.split("/")
+        spelled: List[str] = []
+        for segment in segments:
+            if not (folder / segment).exists():
+                break
+            names = sorted(os.listdir(folder))  # The real letter case, unlike exists().
+            same = ([name for name in names if name == segment]
+                    or [name for name in names if name.casefold() == segment.casefold()])
+            if not same:
+                break  # Not a folder name at all, such as "..".
+            spelled.append(same[0])
+            folder = folder / same[0]
+        return "/".join(spelled + segments[len(spelled):])
 
     def _write(self, fact: Fact) -> Fact:
         # Every rule in _validate_collection is local to one entity/attribute
@@ -615,6 +721,7 @@ class MemoryStore:
                 break
             if parent.is_symlink():
                 raise ValueError("Memory topic folders must not be symbolic links")
+        self._check_topic_spelling(fact.topic)
         missing = [parent for parent in path.parents
                    if parent.is_relative_to(self.memory_dir) and parent != self.memory_dir
                    and not parent.exists()]
@@ -706,15 +813,31 @@ class MemoryStore:
                            source=source, evidence=evidence, deleted=deleted,
                            recorded_at=recorded, supersedes=old.id,
                            confidence=old.confidence if confidence is None else confidence,
-                           topic=old.topic if topic is None else topic)
+                           topic=self._folder_topic(old) if topic is None else topic)
             return self._write(fact)
+
+    def _folder_topic(self, fact: Fact) -> str:
+        """The record's topic spelled like the folder that holds it.
+
+        Earlier releases filed a topic such as "work" into an existing "Work"
+        folder on case-insensitive disks; its revisions follow the folder instead
+        of being refused. A record moved to another folder keeps its own topic,
+        spelled like that topic's existing folder, as a new record's would be.
+        The index path is current: the caller refreshed first.
+        """
+        row = self.connection.execute("SELECT path FROM facts WHERE id = ?", (fact.id,)).fetchone()
+        folder = str(row["path"]).rpartition("/")[0].partition("/")[2]
+        same = folder.isascii() and folder.lower() == fact.topic.lower()  # Topics are ASCII.
+        return folder if same else self.existing_topic(fact.topic)
 
     def correct(self, fact_id: str, value: str, source: str = "manual", evidence: str = "",
                 recorded_at: TimeInput = None, confidence: Optional[float] = None,
                 topic: Optional[str] = None) -> Fact:
         """Revise an assertion at its original effective time; keep the old record.
 
-        ``confidence`` and ``topic`` default to the corrected record's values.
+        ``confidence`` and ``topic`` default to the corrected record's values; the
+        topic is spelled like the folder that holds the record, or, for a record
+        moved out of its topic folder, like that topic's existing folder.
         """
         return self._revision(fact_id, value, source, evidence, recorded_at, False,
                               confidence, topic)

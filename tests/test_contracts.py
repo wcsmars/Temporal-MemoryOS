@@ -3,15 +3,19 @@
 Surviving mutants showed that these could change without any other test
 failing: the JSON shape of search results, the key order of Markdown records
 and proposal files, default arguments, folder and file names, and the guards
-of the proposal queue. The last tests check the rule that
-tools/mutation_summary.py uses to set aside survivors that only change the
-text of a message or the letter case of SQL keywords.
+of the proposal queue. One test checks that conftest.py keeps the Git tests
+working when the temporary folder is inside a Git checkout. The last tests
+check the rule that tools/mutation_summary.py uses to set aside survivors
+that only change the text of a message or the letter case of SQL keywords,
+and that it gives no score for an unfinished run.
 """
 
 import difflib
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import sys
 from datetime import date
 from pathlib import Path
@@ -30,7 +34,8 @@ FACT_KEYS = ["id", "entity", "attribute", "value", "valid_from", "valid_to", "re
 RESULT_KEYS = ["fact", "score", "channels", "citation"]
 PROPOSAL_KEYS = ["id", "entity", "attribute", "value", "valid_from", "source", "evidence",
                  "topic", "created_at", "status", "kind", "confidence", "target_id",
-                 "target_fingerprint", "prior_value", "result_fact_id", "warnings", "dated"]
+                 "target_fingerprint", "prior_value", "result_fact_id", "warnings", "dated",
+                 "observed"]
 CHANNELS = {"keyword", "lexical_embedding", "semantic", "graph"}
 
 
@@ -218,7 +223,8 @@ def test_proposal_files_must_not_be_symbolic_links(store, tmp_path_factory):
     assert json.loads(target.read_text(encoding="utf-8"))["status"] == "pending"
     assert store.all_facts() == []
     assert queue.list(status="all") == []
-    assert queue.problems == ["Proposal files must not be symbolic links"]
+    assert queue.problems == [
+        "Proposal files must not be symbolic links: proposals/{}.json".format(proposal.id)]
 
 
 def test_list_filters_by_status_and_rejects_unknown_statuses(store):
@@ -271,6 +277,27 @@ def test_failed_proposal_save_leaves_no_temporary_file(store, monkeypatch, faili
             queue.approve(pending.id)  # The fact is written; saving the proposal fails.
     assert sorted(os.listdir(queue.directory)) == [".lock", pending.id + ".json"]
     assert queue.get(pending.id).status == "pending"
+
+
+# tests/conftest.py
+
+@pytest.mark.skipif(not shutil.which("git"), reason="Git unavailable")
+def test_git_tests_pass_with_the_temp_folder_inside_a_git_checkout(tmp_path):
+    """Git in a test never finds a repository around pytest's base temp folder,
+    so the Git tests pass when TMPDIR is inside a Git checkout."""
+    repository = Path(__file__).resolve().parents[1]
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True, capture_output=True)
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(repository / "src")
+    environment["HYPOTHESIS_STORAGE_DIRECTORY"] = str(tmp_path / "hypothesis")
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q",
+         "--basetemp", str(checkout / "tmp"),
+         "tests/test_git.py::test_git_init_refuses_parent_repository"],
+        cwd=repository, env=environment, capture_output=True, text=True, timeout=120,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 # tools/mutation_summary.py
@@ -465,3 +492,51 @@ def test_mutation_summary_report(monkeypatch, capsys):
         "other survivors to review: 1",
         "     1  module.x_list",
     ]
+
+
+def test_mutation_summary_without_results_reports_no_score(monkeypatch, capsys):
+    """With no finished run to read, the summary fails instead of printing a zero score."""
+    tool = load_tool()
+    monkeypatch.setattr(tool, "mutmut", lambda *arguments: "")
+    monkeypatch.setattr(sys, "argv", ["mutation_summary.py"])
+    assert tool.main() == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "No mutmut results here" in captured.err
+
+
+@pytest.mark.parametrize("results, hint", [
+    # The baseline tests failed, so mutmut generated the mutants and checked none.
+    ("    pkg.x_add__mutmut_1: not checked\n", "mutmut run\n"),
+    # Interrupted part-way; mutmut checks an interrupted mutant again only by name.
+    ("    pkg.x_add__mutmut_1: killed\n"
+     "    pkg.x_add__mutmut_2: check was interrupted by user\n"
+     "    pkg.x_add__mutmut_3: not checked\n",
+     "mutmut run pkg.x_add__mutmut_2\n"),
+])
+def test_mutation_summary_of_an_unfinished_run_reports_no_score(monkeypatch, capsys, results,
+                                                                 hint):
+    """Mutants that were never checked fail the summary instead of lowering the score."""
+    tool = load_tool()
+    monkeypatch.setattr(tool, "mutmut", lambda *arguments: results)
+    monkeypatch.setattr(sys, "argv", ["mutation_summary.py"])
+    assert tool.main() == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "The mutmut run did not finish" in captured.err
+    assert captured.err.endswith(hint)
+
+
+def test_mutation_summary_shows_why_mutmut_failed(monkeypatch):
+    """A failing mutmut command exits with mutmut's own error and how to install it."""
+    tool = load_tool()
+
+    def run(command, **options):
+        return tool.subprocess.CompletedProcess(command, 1, "", "No module named mutmut\n")
+
+    monkeypatch.setattr(tool.subprocess, "run", run)
+    with pytest.raises(SystemExit) as raised:
+        tool.mutmut("results", "--all", "true")
+    message = str(raised.value.code)
+    assert "mutmut results failed" in message and "No module named mutmut" in message
+    assert "python -m pip install -e '.[mutation]'" in message

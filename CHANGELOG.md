@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.3
+
+Fixes from another full review of the code, the documentation and every step of the user guide.
+
+Memory store
+- `memoryos reindex` checks every page of the index and the column names of its tables first, so damage that a normal open never reads (a record page, an index page, or the schema, including a damaged column name) is set aside and rebuilt; stored record text that is no longer valid UTF-8, or no longer reads as a record, is rebuilt in place. Elsewhere, such damage now gets the repair hint: a CLI message, HTTP 503 and an MCP tool error, instead of a raw database error (HTTP 500) or, for a damaged record, invalid input (HTTP 422).
+- A topic spelled differently from an existing folder on a case-insensitive file system (the macOS default) is refused instead of forcing a full rebuild on every later write; corrections and retractions of a record filed under such a folder, or moved out of its topic folder, follow the existing folder's spelling instead of being refused.
+- A symbolic link in place of `memory/`, `.memoryos/`, the index or its log files, the proposal folder or a proposal file is reported as a problem on disk (HTTP 503) rather than as invalid input (422).
+
+Retrieval
+- A common word inside an entity name ("The Who") counts only when the question names that entity; before, one such entity made the word match every fact. Keyword search decides this after folding accents, so "à" counts as "a".
+- The document-vector cache keeps its most recently used vectors when full; before, it cached nothing for snapshots above 50,000 records.
+- One record with an unusable vector is skipped instead of breaking every hybrid and semantic search; unusable model output is an embedding problem (HTTP 503), not invalid input. A broken dependency inside sentence-transformers is reported with its cause.
+
+Review queue
+- A line with its own date (in the line, or an explicit observation time) that repeats the current value from an earlier date is recorded when approved, so a change approved later for an earlier date cannot override it; it keeps the end of the record it confirms, so it never extends a value past an explicit end; other sources' pending proposals stay valid when such a restatement changes nothing they showed, and a second restatement for the same date is approved by the record the first one wrote. Proposals have a new `observed` field (true when an undated line took an explicit observation time); earlier releases refuse proposal files written by 0.2.3, so settle pending proposals before going back to an older release.
+- An undated restatement does not fold into an older pending proposal when a different value was said in between; re-extracting an unchanged log still returns the existing proposals. On a case-insensitive file system, approving a proposal whose topic differs from an existing folder only in letter case files the record in that folder.
+- Approving again after an interruption also works for restatements and returns to an earlier value, and a fact counts as claimed only by a proposal that states the same thing. Rejecting a proposal whose interrupted approval already wrote its fact is refused while that fact is unrevised and no other pending proposal for the same line can claim it.
+- Sentence rules skip a line that holds more than one sentence instead of putting the second sentence into the value. A sentence end before a closing quote or bracket counts too. A period after a capital initial in any script or a two-letter abbreviation ("J. P. Morgan", "É. Macron", "St. Louis") does not end a sentence; lines with other abbreviations followed by a space ("Mrs. Jones", "e.g."), extracted in 0.2.2, are now skipped, so use the pipe form for them. A repeated line gives one proposal, also after another value was said in between; a byte-order mark at the start of any line is ignored, so text holding only byte-order marks is empty however many lines it has.
+- Proposal-file problems name the file relative to the memory directory and never show an absolute path. Approving no longer reads every proposal file, and extraction looks lines up in an index of the queue.
+
+Interfaces
+- Git checkpoints ignore your personal Git ignore file, which could silently leave records out, and commit topic folders named like database files; the exclude rules of older repositories are rewritten in their intended order.
+- The HTTP API checks the bearer token before reading a request body, also under a root path (`uvicorn --root-path`) or when mounted in another app. It sends `WWW-Authenticate: Bearer` with 401 and limits tags, links and time strings in length, including `as_of` and `known_at` in query strings.
+- `serve --port` outside 0 to 65535 and an empty `--root` give the documented behavior instead of a traceback or using the current folder.
+
+Packaging and verification
+- The package ships a `py.typed` marker; the version has one source. CI adds Python 3.14 and a macOS job, with a job timeout.
+- `tools/mutation_summary.py` reports a missing, failed or unfinished mutation run (mutants never checked) instead of a score, and exits 1; the benchmark charts handle a flat series.
+- The test suite also passes when the temporary folder (TMPDIR) is inside a Git checkout.
+- A new full mutation-testing run. Every surviving mutant was reviewed against the 0.2.3 code, including those already reviewed for 0.2.2, and each verdict checked by a second reviewer. 17 new tests catch the 31 mutants that showed untested behavior. The review found no bug in released code; it found one in a fix made for this release (`memoryos reindex` could refuse to repair an index whose page check happened to quote a missing column), corrected before publishing.
+- Python API: the unused `embeddings.query_terms` helper is removed; the new `MemoryStore.existing_topic()` returns a topic spelled like its existing folder.
+
 ## 0.2.2
 
 Fixes found by a full audit of the code, documentation and release process.

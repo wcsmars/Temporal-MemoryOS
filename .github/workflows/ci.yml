@@ -5,9 +5,10 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       matrix:
-        python-version: ['3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -21,3 +22,14 @@ jobs:
       - run: python benchmarks/scale.py --sizes 30 90 --writes 2 --searches 2 --settle 0 --output benchmark-results-scale.json
       - run: python benchmarks/plot.py --check
       - run: python -m build
+  # The approval queue relies on POSIX file locks; check them on macOS too.
+  test-macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -e '.[api,mcp,dev]'
+      - run: python -m pytest -q

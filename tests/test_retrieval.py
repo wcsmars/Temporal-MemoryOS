@@ -1,12 +1,21 @@
 """Retrieval behavior at temporal, provenance and graph boundaries."""
 
+import math
+import sys
+import time
 import types
+from array import array
 
 import pytest
 
+import temporal_memory_os.retrieval as retrieval_module
 import temporal_memory_os.store as store_module
-from temporal_memory_os.embeddings import HashingEmbedder, SentenceTransformerEmbedder, create_embedder
-from temporal_memory_os.retrieval import HybridRetriever
+from temporal_memory_os.demo import seed_demo
+from temporal_memory_os.embeddings import (EmbeddingUnavailableError, HashingEmbedder,
+                                           SentenceTransformerEmbedder, create_embedder,
+                                           normalized_tokens)
+from temporal_memory_os.models import Fact
+from temporal_memory_os.retrieval import HybridRetriever, VectorCache
 from temporal_memory_os.store import MemoryStore
 
 
@@ -239,3 +248,238 @@ def test_graph_seeds_the_name_written_in_the_query(store):
     # A symbol-only name is never seeded by a query that does not write it.
     assert cup.id not in {hit.fact.id for hit in retriever.search("coffee meaning",
                                                                    mode="graph", limit=10)}
+
+
+# Stopwords, accents, the vector cache and model output
+
+
+def test_a_stopword_in_an_entity_name_counts_only_when_the_query_names_it(store):
+    """"The Who" and "Bank of England" do not make "the" or "of" match every fact."""
+    seed_demo(store)
+    store.add("The Who", "genre", "rock", valid_from="2026-01-01")
+    store.add("Bank of England", "founded", "1694", valid_from="2026-01-01")
+    retriever = HybridRetriever(store, HashingEmbedder())
+    for mode in ("keyword", "semantic", "hybrid"):
+        for question in ("What is the preferred drink for Alex?",
+                         "What is a preferred drink of Alex?"):
+            hits = retriever.search(question, mode=mode, limit=10, as_of="2026-10-10")
+            assert {hit.fact.entity for hit in hits} == {"Alex"}, (mode, question)
+        for query, entity in (("The Who genre", "The Who"),
+                              ("When was the Bank of England founded?", "Bank of England")):
+            [top] = retriever.search(query, mode=mode, limit=1, as_of="2026-10-10")
+            assert top.fact.entity == entity, (mode, query)
+
+
+class Facts:
+    """A fact source that returns the same facts at every time."""
+
+    def __init__(self, facts):
+        self.facts = facts
+
+    def snapshot(self, as_of=None, known_at=None, entity=None):
+        return list(self.facts)
+
+
+def names_written_out(query, facts):
+    """The plain rule: every word of each entity name the query writes out word for word."""
+    written = " {} ".format(" ".join(normalized_tokens(query)))
+    keep = set()
+    for fact in facts:
+        name = normalized_tokens(fact.entity)
+        if name and " {} ".format(" ".join(name)) in written:
+            keep.update(name)
+    return keep
+
+
+def test_a_long_repetitive_query_and_many_names_with_stopwords_stay_fast(monkeypatch):
+    """Finding the names a query writes out costs at most its length times the longest name,
+    and gives the same results as the plain rule."""
+    facts = [Fact("%032x" % number, "a " * 240 + "x%05d" % number, "genre", "rock",
+                  valid_from="2025-01-01") for number in range(1000)]
+    facts += [Fact("%032x" % (1000 + number), name, "founded", year, valid_from="2025-01-01")
+              for number, (name, year) in enumerate([("The Who", "1964"),
+                                                     ("Bank of England", "1694"),
+                                                     ("The The", "1979")])]
+    # Close to the API's 10,000-character limit; it writes out three of the names.
+    query = "a " * 4700 + "x00007 the who of bank of england"
+    retriever = HybridRetriever(Facts(facts), HashingEmbedder())
+    for mode in ("keyword", "graph"):
+        started = time.perf_counter()
+        retriever.search(query, mode=mode)
+        # Typically under 0.1 seconds; matching each name at every position took about 6.
+        assert time.perf_counter() - started < 2.0, mode
+
+    def results():
+        return {mode: [(hit.fact.id, hit.score, hit.channels)
+                       for hit in retriever.search(query, mode=mode, limit=20)]
+                for mode in ("keyword", "semantic", "hybrid")}
+
+    found = results()
+    assert {hit[0] for hit in found["keyword"]} >= {"%032x" % 7, "%032x" % 1000, "%032x" % 1001}
+    monkeypatch.setattr(retrieval_module, "_named_words", names_written_out)
+    assert results() == found
+
+
+def test_names_that_are_prefixes_of_each_other_stay_fast(monkeypatch):
+    """Each written-out name is collected once, even when names extend one another."""
+    facts = [Fact("%032x" % number, " ".join(["the"] * (number + 1)), "genre", "rock",
+                  valid_from="2025-01-01") for number in range(400)]
+    query = "the " * 2400
+    retriever = HybridRetriever(Facts(facts), HashingEmbedder())
+    started = time.perf_counter()
+    found = [hit.fact.id for hit in retriever.search(query, mode="keyword", limit=5)]
+    # Typically under 0.1 seconds; collecting every name at every match took about 1.6.
+    assert time.perf_counter() - started < 0.6
+    monkeypatch.setattr(retrieval_module, "_named_words", names_written_out)
+    assert [hit.fact.id for hit in retriever.search(query, mode="keyword", limit=5)] == found
+
+
+def test_graph_search_and_a_learned_model_never_look_for_names_in_the_query(store,
+                                                                             monkeypatch):
+    """Only keyword matching and word hashing drop stopwords, so only they need the names."""
+    fact = store.add("The Who", "genre", "rock", valid_from="2025-01-01")
+
+    class Flat:
+        semantic = True
+        name = "flat-fixture"
+
+        def embed(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+    def never(query, facts):
+        raise AssertionError("names were looked for")
+
+    monkeypatch.setattr(retrieval_module, "_named_words", never)
+    graph = HybridRetriever(store, HashingEmbedder()).search("The Who", mode="graph")
+    assert [hit.fact.id for hit in graph] == [fact.id]
+    learned = HybridRetriever(store, Flat()).search("The Who", mode="semantic")
+    assert [hit.fact.id for hit in learned] == [fact.id]
+
+
+@pytest.mark.parametrize("query", ["Alex habite à Lyon", "Alex thé", "Alex À"])
+def test_keyword_stopwords_are_recognized_with_accents(store, query):
+    """A query word that is a stopword once its accent is folded does not match every fact."""
+    store.add("Alex", "home city", "Lyon", valid_from="2024-01-01",
+              evidence="Alex moved to Lyon.")
+    store.add("Bob", "employer", "Acme", valid_from="2024-01-01",
+              evidence="Bob has a job at the lab.")
+    retriever = HybridRetriever(store, HashingEmbedder())
+    for mode in ("keyword", "hybrid"):
+        assert [hit.fact.entity for hit in retriever.search(query, mode=mode)] == ["Alex"], mode
+
+
+class CountingHashing(HashingEmbedder):
+    """The offline lexical embedder, recording every batch it is asked to embed."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def embed(self, texts):
+        self.calls.append(list(texts))
+        return super().embed(texts)
+
+
+def test_a_store_larger_than_the_vector_cache_still_reuses_most_vectors(store):
+    """Only the documents that did not fit in the cache are embedded again."""
+    for name in ("alpha", "beta", "gamma"):
+        store.add(name, "drink", "tea", valid_from="2025-01-01")
+    embedder = CountingHashing()
+    retriever = HybridRetriever(store, embedder)
+    retriever.cache_limit = 2
+    first = retriever.search("tea", mode="semantic")
+    second = retriever.search("tea", mode="semantic")
+    assert [len(batch) for batch in embedder.calls] == [4, 2]  # The query and one document.
+    assert [hit.fact.id for hit in first] == [hit.fact.id for hit in second]
+
+
+def test_the_vector_cache_drops_the_least_recently_used_entry():
+    """A vector read since it was stored outlives one that was not."""
+    entry = (2, None, array("d", [1.0, 0.0]), 1.0, frozenset({"tea"}))
+    cache = VectorCache()
+    cache.store({("m", "a"): entry, ("m", "b"): entry}, limit=2)
+    assert cache.get(("m", "a")) is not None
+    cache.store({("m", "c"): entry}, limit=2)
+    assert len(cache) == 2
+    assert cache.get(("m", "b")) is None
+    assert cache.get(("m", "a")) is not None and cache.get(("m", "c")) is not None
+
+
+class Marked:
+    """A learned-model stand-in: a text containing a marker gets that marker's vector."""
+
+    semantic = True
+
+    def __init__(self, markers, name="marked-fixture"):
+        self.name = name
+        self.markers = markers
+        self.calls = []
+
+    def embed(self, texts):
+        self.calls.append(list(texts))
+        return [next((vector for marker, vector in self.markers.items() if marker in text),
+                     [0.6, 0.8]) for text in texts]
+
+
+@pytest.mark.parametrize("bad", [[math.nan, 0.0], [math.inf, 0.0], [1e200, 1e200], ["x", 0.0]],
+                         ids=["nan", "inf", "norm-overflow", "not-a-number"])
+def test_one_document_the_model_cannot_embed_does_not_break_search(store, bad):
+    """A record whose vector is unusable is skipped; the other records are still found."""
+    tea = store.add("Alex", "drink", "tea", valid_from="2025-01-01")
+    store.add("Bob", "note", "overflow", valid_from="2025-01-01")
+    embedder = Marked({"overflow": bad})
+    retriever = HybridRetriever(store, embedder)
+    for mode in ("semantic", "hybrid"):
+        hits = retriever.search("Alex drink", mode=mode)
+        assert [hit.fact.id for hit in hits] == [tea.id], mode
+    # Not cached, so a later search tries the unusable record again.
+    assert len(embedder.calls[1]) == 2
+
+
+@pytest.mark.parametrize("vectors, message", [
+    ([[math.nan, 0.0], [1.0, 0.0]], "finite"),
+    ([["x", 0.0], [1.0, 0.0]], "finite"),
+    ([[1.0, 0.0], [1.0, 0.0, 0.0]], "dimensions"),
+    ([[1.0, 0.0]], "wrong number"),
+], ids=["nan-query", "text-query", "dimensions", "count"])
+def test_unusable_model_output_is_an_unavailable_model_not_invalid_input(store, vectors,
+                                                                           message):
+    """A bad query vector, vector count or size is the model's fault, not the request's."""
+    store.add("person", "drink", "tea", valid_from="2025-01-01")
+
+    class Provider:
+        semantic = True
+        name = "broken"
+
+        def embed(self, texts):
+            return vectors
+
+    with pytest.raises(EmbeddingUnavailableError, match=message) as caught:
+        HybridRetriever(store, Provider()).search("tea", mode="semantic")
+    assert not isinstance(caught.value, ValueError)
+
+
+class MissingInnerDependency:
+    """An import hook that fails the way a mismatched dependency of the package does."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name == "sentence_transformers":
+            raise ModuleNotFoundError("No module named 'huggingface_hub'", name="huggingface_hub")
+        return None
+
+
+@pytest.mark.parametrize("how", ["inner-module", "missing-name"])
+def test_a_broken_sentence_transformers_install_reports_its_cause(monkeypatch, how):
+    """Only a missing package gets the install hint; any other import error is named."""
+    if how == "inner-module":
+        monkeypatch.delitem(sys.modules, "sentence_transformers", raising=False)
+        monkeypatch.setattr(sys, "meta_path", [MissingInnerDependency(), *sys.meta_path])
+        cause = r"ModuleNotFoundError: No module named 'huggingface_hub'"
+    else:
+        monkeypatch.setitem(sys.modules, "sentence_transformers",
+                            types.ModuleType("sentence_transformers"))
+        cause = r"ImportError: cannot import name 'SentenceTransformer'"
+    with pytest.raises(EmbeddingUnavailableError,
+                       match=r"Could not import sentence-transformers \(" + cause) as caught:
+        SentenceTransformerEmbedder("local-model").embed(["text"])
+    assert "pip install" not in str(caught.value)
