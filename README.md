@@ -51,6 +51,25 @@ PYTHONPATH=src python3 -m temporal_memory_os --root ./memory-data demo
 
 The default embedding provider is **lexical hashing**, not a learned semantic model. Learned semantic embeddings require the optional provider below. Extraction is a deliberately narrow rule-based parser; it does not claim to understand arbitrary conversation.
 
+## Repository contents and local data
+
+This repository includes the current memory engine, interfaces, tests, synthetic examples,
+benchmark generators, results, and setup instructions. The implemented public features run
+without a private implementation. The benchmark documentation identifies historical source
+that is not included, and optional SDKs and model providers retain their own terms.
+
+Personal memory, conversation exports, credentials, local configuration, private reports,
+and environments stay outside the published files. The default `memory-data/` directory,
+`.env` files, and credential files are ignored. For a custom `--root` or `MEMORYOS_HOME`,
+choose a location outside this checkout or beneath `memory-data/`; an arbitrary folder name
+is not automatically ignored. Share only synthetic or properly cleared sample data and
+configuration templates with placeholder values.
+
+Ignore rules do not remove tracked files or earlier commits. Public branches and tags are
+public too. If a credential was published, revoke or rotate it before cleaning up Git
+history; copies in other clones may remain. Keep confidential third-party code and licensed
+private datasets out of the repository.
+
 ## Results
 
 All numbers come from synthetic data on one laptop; the [benchmark methodology](benchmarks/README.md) states what they do and do not show.
@@ -81,7 +100,7 @@ Medians on an Apple-silicon laptop with Python 3.11; [raw reports](benchmarks/re
 These commands use a fresh directory so they do not collide with the demo's synthetic records.
 
 ```sh
-export MEMORYOS_HOME=./my-memory
+export MEMORYOS_HOME=./memory-data/personal
 memoryos add "Acme application" status pending \
   --from 2026-09-01 --source "conversation:001" \
   --evidence "The application was submitted and is awaiting review." \

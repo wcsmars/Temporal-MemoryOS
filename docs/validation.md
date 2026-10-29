@@ -5,7 +5,7 @@
 Validated on macOS arm64 with Python 3.11.7. This revision adds the optional Claude Agent SDK integration and the storage, approval, retrieval and checkpoint repairs in the changelog.
 
 - Full local suite: **1,144 passed, 1 skipped**, with **98.44% combined line/branch coverage** including CLI subprocesses. The skipped non-UTF-8 filename test requires a filesystem that supports such names. Property-based histories still compare against an independent reference model.
-- Ruff and mypy pass across 13 source modules. The separate private release-maintenance suite passes 388 tests. The release has 64 manifest files; 63 match the main folder byte for byte and the remaining file is the release-specific `.gitignore`.
+- Ruff and mypy pass across 13 source modules. The separate private release-maintenance suite passes 436 tests. The release has 64 manifest files; 63 match the main folder byte for byte and the remaining file is the release-specific `.gitignore`.
 - New regressions cover replaced folder symlinks, nonregular Markdown files, nested transaction rollback and SQLite auto-abort, concurrent proposal approval, symbol-only entity names, malformed embedding output, and nested Git repositories/gitlinks in checkpoints.
 - The 35 SDK tests run offline. Six contract cases comprise four checks using the installed SDK's real subprocess transport with a local protocol peer, plus two simulated cancellation cases. They check command restrictions, suppressed provider diagnostics, failures, cancellation and child-process cleanup. The peer does not call a model. The SDK dependency tested is `claude-agent-sdk==0.2.174`.
 - A live SDK test used only two synthetic application facts. The model called search and history, answered the September 10 state as pending, and cited the exact fact ID and source. Both temporal cutoffs were passed correctly, and hashes of all canonical Markdown records were unchanged. Two live smoke calls passed. The final configuration reported four turns and $0.001110625 in model cost; the earlier call reported three turns and $0.0008784. These checks establish integration, not general answer accuracy or guaranteed citation fidelity.
@@ -15,6 +15,21 @@ Validated on macOS arm64 with Python 3.11.7. This revision adds the optional Cla
 - Learned embedding weights were not downloaded. Provider behavior is covered with injected implementations and malformed-output tests.
 - Mutation testing of the five core modules completed: **4,043 mutants, 3,702 test kills, 331 survivors, 9 timeouts and 1 killed process**. Isolated follow-ups passed all controls: two timeout cases failed assertions and seven were confirmed nonterminating under explicit wall-clock limits. The killed process is reported separately, not counted as a test kill. Six earlier survivors were caught by strengthened file-replacement regressions. All remaining survivors were reviewed: 165 equivalent, 153 diagnostic-only, 10 platform-dependent, two cache-limit changes and one equivalent result with unnecessary trie work. The platform-dependent cases concern a case-sensitive filesystem. A later broad serial rerun reached its wall limit; it does not supersede the completed run or the isolated checks. `mutmut` 3.8 does not generate mutants for generator/context-manager bodies, so these results do not cover the transaction context manager; failure-injection tests and independent code review cover that code.
 - Remote validation is tracked by the [GitHub Actions workflow](https://github.com/wcsmars/Temporal-MemoryOS/actions/workflows/ci.yml) for each commit. It runs Python 3.10–3.14 on Linux and Python 3.11 on macOS. Local results above are distinct from remote job outcomes.
+
+### Publication boundary review: 29 October 2026
+
+The public release keeps the current implementation, tests and synthetic demonstrations.
+The private release-maintenance suite now has **436 passing tests**. New cases cover private
+and credential/configuration paths in deleted Git history, source symlinks, forbidden
+manifest paths, and flagged source content before copying. Tags must resolve to commits;
+direct blob/tree tags are refused so unsupported objects cannot escape the history scan.
+Ordinary example configurations and implementation modules remain publishable.
+
+The README's personal-memory example now uses the ignored `memory-data/personal` path.
+A smoke check created and retrieved a synthetic fact there and confirmed every generated
+file matched the release ignore rules. These changes affect publication controls,
+documentation and ignore rules; the engine and pinned benchmark results are unchanged.
+Automated scans supplement manual review of personal data and distribution rights.
 
 ## Historical validation: 0.2.4 and 0.2.3
 

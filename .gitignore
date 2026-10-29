@@ -36,6 +36,14 @@ mutants/
 config.yaml
 config.yml
 credentials/
+credentials.json
+credentials.yaml
+credentials.yml
+secrets.json
+secrets.yaml
+secrets.yml
+service-account.json
+service_account.json
 private/
 data/raw/
 /secrets.*
