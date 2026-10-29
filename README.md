@@ -192,7 +192,10 @@ There is no custom model/tool execution loop.
 
 ```sh
 python -m pip install -e '.[agent]'
-# Set ANTHROPIC_API_KEY in this shell using your own local secret configuration.
+# Enter the key at the hidden prompt; it is exported only in this shell.
+ANTHROPIC_API_KEY="$(python -c 'import getpass; print(getpass.getpass("Anthropic API key: "))')"
+export ANTHROPIC_API_KEY
+# Skip these two lines if your environment already exports the key.
 # An optional .env file is ignored by Git, but is not loaded automatically.
 memoryos --root ./memory-data demo
 memoryos --root ./memory-data agent "What was the Acme application status?" \
