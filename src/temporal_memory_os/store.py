@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import os
 import re
@@ -188,6 +189,8 @@ class MemoryStore:
         # hit, so a rebuild by another process can never serve a stale record.
         self._parsed: Dict[str, Tuple[str, Fact]] = {}
         self._undo: List[Callable[[], None]] = []
+        self._transaction_depth = 0
+        self._rollback_only = False
         self.connection = self._open(repair_index)
         try:
             self.refresh()
@@ -330,21 +333,62 @@ class MemoryStore:
     @contextmanager
     def _transaction(self) -> Iterator[None]:
         with self._lock:
-            self.connection.execute("BEGIN IMMEDIATE")
+            # Proposal approval holds the write lock across stale-preview checks
+            # and a call to add/correct. Savepoints make those nested writes atomic
+            # while still allowing an inner failure to be caught by its caller.
+            nested = self._transaction_depth > 0
+            if nested and (self._rollback_only or not self.connection.in_transaction):
+                self._rollback_only = True
+                raise sqlite3.OperationalError("Memory write transaction was aborted; retry the operation")
+            savepoint = "memoryos_{}".format(self._transaction_depth)
+            try:
+                self.connection.execute("SAVEPOINT " + savepoint if nested else "BEGIN IMMEDIATE")
+            except BaseException:
+                if nested:
+                    self._rollback_only = True
+                raise
+            if not nested:
+                self._rollback_only = False
+            parent_undo = self._undo
             self._undo = []
+            self._transaction_depth += 1
             try:
                 yield
-                self.connection.execute("COMMIT")
+                # SQLITE_FULL/IOERR may roll back the entire SQLite transaction.
+                # Even if a caller catches that inner failure, no later savepoint
+                # may start and commit a standalone write inside this scope.
+                if self._rollback_only or not self.connection.in_transaction:
+                    raise sqlite3.OperationalError(
+                        "Memory write transaction was aborted; retry the operation")
+                self.connection.execute("RELEASE SAVEPOINT " + savepoint if nested else "COMMIT")
+                if nested:
+                    parent_undo.extend(self._undo)
             except BaseException:
-                if self.connection.in_transaction:
-                    self.connection.execute("ROLLBACK")
-                # Files written in this transaction must not outlive it, even
-                # when the failure is the COMMIT itself.
-                for undo in reversed(self._undo):
-                    undo()
+                try:
+                    if self.connection.in_transaction:
+                        if nested:
+                            self.connection.execute("ROLLBACK TO SAVEPOINT " + savepoint)
+                            self.connection.execute("RELEASE SAVEPOINT " + savepoint)
+                        else:
+                            self.connection.execute("ROLLBACK")
+                    elif nested:
+                        self._rollback_only = True
+                except BaseException:
+                    # A failed ROLLBACK TO leaves the nested SQL changes present.
+                    # The outer scope must roll back even if the error is caught.
+                    self._rollback_only = True
+                    raise
+                finally:
+                    # Even a failed COMMIT/ROLLBACK must not leave new Markdown
+                    # behind to be reimported by the next refresh.
+                    for undo in reversed(self._undo):
+                        undo()
                 raise
             finally:
-                self._undo = []
+                self._transaction_depth -= 1
+                self._undo = parent_undo
+                if not nested:
+                    self._rollback_only = False
 
     @staticmethod
     def _render(fact: Fact) -> str:
@@ -364,6 +408,8 @@ class MemoryStore:
         files that way (Emacs's lock file is a dangling ``.#name.md`` link),
         and hidden folders belong to other tools.
         """
+        if self.memory_dir.is_symlink():
+            raise StoreIntegrityError("memory/: memory files and folders must not be symbolic links")
         found: Dict[str, Tuple[int, int]] = {}
         pending = [(str(self.memory_dir), "memory/")]
         while pending:
@@ -380,10 +426,40 @@ class MemoryStore:
                             found[relative] = (-1, -1)
                         else:
                             status = entry.stat(follow_symlinks=False)
+                            if not stat.S_ISREG(status.st_mode):
+                                raise StoreIntegrityError(
+                                    "{}: memory files must be regular files".format(relative))
                             found[relative] = (status.st_size, status.st_mtime_ns)
                     elif entry.is_symlink() and entry.is_dir():
                         found[relative] = (-1, -1)  # Linked folders are rejected on rebuild.
         return found
+
+    def _read_markdown(self, relative: str) -> bytes:
+        """Read a regular file without blocking on a pipe or following a file link.
+
+        Check again at read time: an editor or another process can replace an
+        entry after the signature scan. Nonblocking open lets us inspect a FIFO
+        without waiting for a writer; the descriptor's type is then authoritative.
+        """
+        path = self.root / relative
+        for parent in path.parents:
+            if parent.is_symlink():
+                raise StoreIntegrityError(
+                    "{}: memory files and folders must not be symbolic links".format(relative))
+            if parent == self.memory_dir:
+                break
+        try:
+            descriptor = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise StoreIntegrityError(
+                    "{}: memory files and folders must not be symbolic links".format(relative)) from exc
+            raise
+        with os.fdopen(descriptor, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise StoreIntegrityError(
+                    "{}: memory files must be regular files".format(relative))
+            return handle.read()
 
     def _check(self, scan: Dict[str, Tuple[int, int]]) -> Optional[List[str]]:
         """None if the index is stale; otherwise the files whose contents were
@@ -405,7 +481,7 @@ class MemoryStore:
             if mtime_ns + _RACY_WINDOW_NS >= row["verified_ns"]:
                 racy.append(relative)
         for relative in racy:
-            digest = hashlib.sha256((self.root / relative).read_bytes()).hexdigest()
+            digest = hashlib.sha256(self._read_markdown(relative)).hexdigest()
             if digest != rows[relative]["sha256"]:
                 return None
         return racy
@@ -494,7 +570,7 @@ class MemoryStore:
             if path.is_symlink() or not path.resolve().is_relative_to(memory_root):
                 raise ValueError("{}: memory files and folders must not be symbolic links".format(
                     relative))
-            raw = path.read_bytes()
+            raw = self._read_markdown(relative)
             size, mtime_ns = scan[relative]
             sources.append((relative, size, mtime_ns, hashlib.sha256(raw).hexdigest(), now))
             fact = self._parse(Path(relative), raw)
@@ -606,8 +682,11 @@ class MemoryStore:
             self.connection.execute("BEGIN")
             try:
                 racy = self._check(scan)
-            finally:
                 self.connection.execute("COMMIT")
+            except BaseException:
+                if self.connection.in_transaction:
+                    self.connection.execute("ROLLBACK")
+                raise
             if racy is not None:
                 if racy:
                     self._mark_verified()
@@ -747,7 +826,8 @@ class MemoryStore:
             self.connection.execute(
                 "INSERT INTO sources VALUES (?, ?, ?, ?, ?)",
                 (path.relative_to(self.root).as_posix(), status.st_size, status.st_mtime_ns,
-                 hashlib.sha256(path.read_bytes()).hexdigest(), time.time_ns()))
+                 hashlib.sha256(self._read_markdown(
+                     path.relative_to(self.root).as_posix())).hexdigest(), time.time_ns()))
         except BaseException:
             # The transaction's undo list removes the new record if it was
             # already renamed into place; older files are never touched.

@@ -6,7 +6,7 @@
 
 An application can be pending on September 10, invited on September 20, and completed on October 2. Searching the latest state should not rewrite that history. Temporal MemoryOS stores dated assertions in nested Markdown files, reconstructs the relevant state, and retrieves facts with their evidence and provenance.
 
-A local Python library and CLI work without API keys or third-party dependencies. Optional FastAPI, MCP, and learned embeddings provide integrations. All bundled examples are synthetic.
+A local Python library and CLI work without API keys or third-party dependencies. Optional FastAPI, MCP, learned embeddings, and the Claude Agent SDK provide integrations. All bundled examples are synthetic.
 
 ## Quick start
 
@@ -183,6 +183,53 @@ The semantic threshold (default 0.25) suits MiniLM; models with different simila
 
 Modes are `keyword`, `semantic`, `graph`, and `hybrid`. Without a learned model, the embedding channel is clearly returned as `lexical_embedding`. Common question words such as "what" and "does" are ignored in keyword and lexical matching unless the question names an entity that contains them (so "The Who" is still found), and text is compared after Unicode normalization and case folding; keyword matching also ignores accents. Graph retrieval follows links in either direction for one hop. Temporal filtering occurs before every retrieval channel, including the relationships used for expansion. Rank fusion gives tied scores the same rank. Results are evidence records rather than generated answers, and scores are ranks, not probabilities.
 
+## Ask with the Claude Agent SDK
+
+The optional agent delegates model calls and tool execution to the official
+[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python).
+Temporal MemoryOS supplies its three read-only MCP tools: search, fetch, and history.
+There is no custom model/tool execution loop.
+
+```sh
+python -m pip install -e '.[agent]'
+# Set ANTHROPIC_API_KEY in this shell using your own local secret configuration.
+# An optional .env file is ignored by Git, but is not loaded automatically.
+memoryos --root ./memory-data demo
+memoryos --root ./memory-data agent "What was the Acme application status?" \
+  --as-of 2026-09-10 --known-at 2026-09-20
+```
+
+The JSON response includes the answer, session ID, turn count, reported model cost,
+and normalized time cutoffs. It asks the model to cite fact IDs and sources. Generated
+answers and citations still need review. The model receives the question and any
+memory returned by tools, so use a memory directory whose contents you intend to send
+to your configured provider. The default core CLI, extraction, and search remain
+offline; an optional learned embedding model may download weights.
+
+Both dates default to the same captured current instant. These dates guide model tool
+calls; they do not restrict which audit records the MCP server can read. Use the
+ordinary `search` command when you need deterministic date filtering without a model.
+
+Defaults are eight turns, a $0.50 SDK model budget, and a 120-second run deadline
+(SDK process cleanup can take a few additional seconds). Override
+with `--max-turns`, `--max-budget-usd`, and `--timeout`; choose an available model with
+`--model`. The budget is enforced by the SDK between model calls, not a guarantee
+against the final call exceeding it. Authentication and billing follow the provider's
+[SDK documentation](https://code.claude.com/docs/en/agent-sdk/overview).
+
+The runner disables built-in tools, uses only its configured MCP server, loads no
+user/project settings, and disables conversation persistence. It runs in a temporary
+working directory and cannot approve proposals through its exposed tools. Memory reads
+may refresh the derived SQLite index. SDK diagnostics are suppressed to keep provider
+response bodies out of CLI errors. No API key is saved in memory or accepted as a CLI
+argument. The optional SDK bundles a runtime; the Python wrapper is open source, while
+the bundled runtime and hosted model have their own terms.
+
+Python callers import `ask` from `temporal_memory_os.agent`, then use
+`await ask(root, question, ...)` inside their async application.
+The SDK tests run offline; live synthetic validation is recorded separately in
+[the validation record](docs/validation.md).
+
 ## HTTP API
 
 ```sh
@@ -271,6 +318,8 @@ This also removes records committed after `COMMIT`. Files that were never commit
 | `tools/mutation_summary.py` | Summarizes a mutation-testing run and lists survivors worth review |
 | `docs/` | [Architecture and temporal semantics](docs/architecture.md), [validation record](docs/validation.md) |
 
+Checkpoints refuse nested Git repositories and submodule gitlinks inside memory or proposal folders, because Git would otherwise omit their contents.
+
 ## Verification
 
 Each layer catches a different kind of mistake. CI runs every layer except mutation testing on each push, on Linux for Python 3.10 to 3.14, and runs the tests on macOS too.
@@ -280,14 +329,14 @@ Each layer catches a different kind of mistake. CI runs every layer except mutat
 | Behavioral tests | Temporal semantics, corrections, retractions, outside edits, damaged files and indexes, interrupted writes and approvals, CLI, HTTP API, MCP tools, Git checkpoints, and writers in separate processes |
 | Regression and contract tests | One or more tests per fixed bug, each confirmed to fail when its fix is reverted, and the JSON shapes, defaults and file names that users and scripts rely on |
 | Property-based tests | Random histories of adds, corrections, retractions and searches, compared after every step with an independent reference model of the time rules, including which writes must be rejected and why. Also: time normalization ordering, Markdown round-trips of arbitrary text, and extraction of arbitrary structured lines |
-| Coverage | Branch coverage, including the CLI's child processes; CI fails below 90% (currently 98.6%) |
+| Coverage | Branch coverage, including the CLI's child processes; CI fails below 90% (see the dated validation record for the current measurement) |
 | Types | `mypy` with every function annotated and all bodies checked |
-| Mutation testing | Breaks the core modules one small change at a time (3,983 mutants) and checks that some test fails |
+| Mutation testing | Breaks the core modules one small change at a time (3,983 mutants in the 0.2.3 review) and checks that some test fails |
 | Benchmarks | Exact-version retrieval against baselines and latency as the store grows; CI fails if accuracy changes or a chart no longer matches its report |
 
 ```sh
-python -m pip install -e '.[api,mcp,dev]'
-pytest -q --cov          # 1,070 tests, coverage report and 90% floor
+python -m pip install -e '.[api,mcp,agent,dev]'
+pytest -q --cov          # full test suite, coverage report and 90% floor
 ruff check .
 mypy
 python benchmarks/run.py --entities 50 --check --output benchmark-results.json
@@ -301,7 +350,7 @@ HYPOTHESIS_PROFILE=mutation mutmut run
 python tools/mutation_summary.py
 ```
 
-In the latest run, on version 0.2.3, tests caught 3,642 of 3,983 mutants (91.4%); 340 survived and one crashed the test process. Of the survivors, 162 only change the wording of an error message or the letter case of an SQL keyword, which the tests deliberately do not pin; without them the score is 95.3%. Every other survivor was reviewed one by one against the 0.2.3 code, including those already reviewed for 0.2.2, and a second reviewer tried to refute each verdict. 127 are equivalent: no input can tell them apart from the original, for example a codec name in capitals, which Python matches case-insensitively, or a check on a branch that earlier validation rules out. 41 change only an error message's wording, a temporary file's name or a cache's size limit. The other 10 are caught on a case-sensitive file system, as on CI's Linux runners; on macOS, where the run took place, a folder name in another letter case names the same folder. Each review added tests for behavior no earlier test checked, most of them in `tests/*_pins.py`; in 0.2.3, 17 tests catch 31 mutants that had survived. The 0.2.2 mutation review, with an adversarial check of its fixes, found 22 edge-case bugs; the 0.2.3 mutation review found one, in a fix made during this release, and it was corrected before publishing (see the changelog).
+In the historical run on version 0.2.3, tests caught 3,642 of 3,983 mutants (91.4%); 340 survived and one crashed the test process. Of the survivors, 162 only change the wording of an error message or the letter case of an SQL keyword, which the tests deliberately do not pin; without them the score is 95.3%. Every other survivor was reviewed one by one against the 0.2.3 code, including those already reviewed for 0.2.2, and a second reviewer tried to refute each verdict. 127 are equivalent: no input can tell them apart from the original, for example a codec name in capitals, which Python matches case-insensitively, or a check on a branch that earlier validation rules out. 41 change only an error message's wording, a temporary file's name or a cache's size limit. The other 10 are caught on a case-sensitive file system, as on CI's Linux runners; on macOS, where the run took place, a folder name in another letter case names the same folder. Each review added tests for behavior no earlier test checked, most of them in `tests/*_pins.py`; in 0.2.3, 17 tests catch 31 mutants that had survived. The 0.2.2 mutation review, with an adversarial check of its fixes, found 22 edge-case bugs; the 0.2.3 mutation review found one, in a fix made during this release, and it was corrected before publishing (see the changelog).
 
 See [the validation record](docs/validation.md) and the [changelog](CHANGELOG.md). The benchmarks measure exact-version retrieval and latency, not generated answer accuracy.
 

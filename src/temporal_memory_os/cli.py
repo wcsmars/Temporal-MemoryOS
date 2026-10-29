@@ -68,6 +68,14 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
     commands.add_parser("mcp", help="Run the optional read-only MCP stdio server")
+    agent = commands.add_parser("agent", help="Ask through the optional Claude Agent SDK")
+    agent.add_argument("question")
+    agent.add_argument("--as-of")
+    agent.add_argument("--known-at")
+    agent.add_argument("--model")
+    agent.add_argument("--max-turns", type=int, default=8)
+    agent.add_argument("--max-budget-usd", type=float, default=0.5)
+    agent.add_argument("--timeout", type=float, default=120)
     commands.add_parser("git-init", help="Opt in to Git history in a separate memory directory")
     checkpoint = commands.add_parser("checkpoint", help="Commit memory files to local Git")
     checkpoint.add_argument("--message", required=True)
@@ -81,6 +89,12 @@ def _execute(args: argparse.Namespace) -> Any:
     # were not given, like an empty MEMORYOS_HOME: never the working directory.
     location = args.root or os.environ.get("MEMORYOS_HOME") or "./memory-data"
     root = Path(location).expanduser().resolve()
+    if args.command == "agent":
+        import asyncio
+        from .agent import ask
+        return asyncio.run(ask(root, args.question, as_of=args.as_of, known_at=args.known_at,
+                               model=args.model, max_turns=args.max_turns,
+                               max_budget_usd=args.max_budget_usd, timeout=args.timeout))
     if args.command == "serve":
         if not 0 <= args.port <= 65535:
             raise ValueError("--port must be between 0 and 65535")

@@ -528,50 +528,60 @@ class ProposalQueue:
                 return self.store.get(_required(proposal.result_fact_id, "result_fact_id"))
             if proposal.status != "pending":
                 raise MemoryConflictError("Only pending proposals can be approved")
+            # Persist outside edits even if the approval later proves stale.
             self.store.refresh()
-            produced = self._produced(proposal)
-            if produced is not None:
-                proposal.status, proposal.result_fact_id = "approved", produced.id
-                self._save(proposal)
-                return produced
-            current = self._classify(proposal.entity, proposal.attribute, proposal.value,
-                                     proposal.valid_from)
-            kind, target_id = proposal.kind, proposal.target_id
-            if (current.get("kind"), current.get("target_id"), current.get("target_fingerprint")
-                    ) != (proposal.kind, proposal.target_id, proposal.target_fingerprint):
-                # Only an expected predecessor changed the preview: apply what it needs now.
-                kind = self._check_still_valid(proposal, current)
-                target_id = current.get("target_id")
-            confirmed = (self.store.get(_required(target_id, "target_id"))
-                         if kind == "duplicate" else None)
-            if confirmed is not None and ((not proposal.dated and not proposal.observed)
-                                          or confirmed.valid_from == proposal.valid_from):
-                # Nothing new: an undated line extracted "now" restates what holds now,
-                # and a line for the confirmed record's own date restates that record.
-                result = confirmed
-            elif kind == "correct":
-                # The corrected record keeps its topic folder; the confidence is
-                # that of the new statement.
-                result = self.store.correct(_required(proposal.target_id, "target_id"),
-                                            proposal.value, source=proposal.source,
-                                            evidence=proposal.evidence,
-                                            confidence=proposal.confidence)
-            else:
-                # A line restating the value in effect at its own date (or observation
-                # time) is recorded too, so a change approved later for an earlier date
-                # cannot override it. It keeps the confirmed record's own end (as stored,
-                # not as bounded by the next value), so it never extends the value past
-                # an explicit end. On a case-insensitive disk, a topic spelled unlike
-                # its existing folder is filed there under the folder's spelling.
-                result = self.store.add(entity=proposal.entity, attribute=proposal.attribute,
-                                        value=proposal.value, valid_from=proposal.valid_from,
-                                        valid_to=None if confirmed is None else confirmed.valid_to,
-                                        source=proposal.source, evidence=proposal.evidence,
-                                        confidence=proposal.confidence,
-                                        topic=self.store.existing_topic(proposal.topic))
+            # Hold the store's writer transaction from preview validation through
+            # the write: a direct add/correction does not take the queue lock.
+            with self.store._transaction():
+                self.store._refresh_locked()
+                result = self._approve_pending(proposal)
+            # The fact must commit first. An interrupted status save is recoverable
+            # via _produced; an approved status pointing at a rolled-back fact is not.
             proposal.status, proposal.result_fact_id = "approved", result.id
             self._save(proposal)
             return result
+
+    def _approve_pending(self, proposal: Proposal) -> Fact:
+        """Validate and write under both the queue lock and store transaction."""
+        produced = self._produced(proposal)
+        if produced is not None:
+            return produced
+        current = self._classify(proposal.entity, proposal.attribute, proposal.value,
+                                 proposal.valid_from)
+        kind, target_id = proposal.kind, proposal.target_id
+        if (current.get("kind"), current.get("target_id"), current.get("target_fingerprint")
+                ) != (proposal.kind, proposal.target_id, proposal.target_fingerprint):
+            # Only an expected predecessor changed the preview: apply what it needs now.
+            kind = self._check_still_valid(proposal, current)
+            target_id = current.get("target_id")
+        confirmed = (self.store.get(_required(target_id, "target_id"))
+                     if kind == "duplicate" else None)
+        if confirmed is not None and ((not proposal.dated and not proposal.observed)
+                                      or confirmed.valid_from == proposal.valid_from):
+            # Nothing new: an undated line extracted "now" restates what holds now,
+            # and a line for the confirmed record's own date restates that record.
+            result = confirmed
+        elif kind == "correct":
+            # The corrected record keeps its topic folder; the confidence is
+            # that of the new statement.
+            result = self.store.correct(_required(proposal.target_id, "target_id"),
+                                        proposal.value, source=proposal.source,
+                                        evidence=proposal.evidence,
+                                        confidence=proposal.confidence)
+        else:
+            # A line restating the value in effect at its own date (or observation
+            # time) is recorded too, so a change approved later for an earlier date
+            # cannot override it. It keeps the confirmed record's own end (as stored,
+            # not as bounded by the next value), so it never extends the value past
+            # an explicit end. On a case-insensitive disk, a topic spelled unlike
+            # its existing folder is filed there under the folder's spelling.
+            result = self.store.add(entity=proposal.entity, attribute=proposal.attribute,
+                                    value=proposal.value, valid_from=proposal.valid_from,
+                                    valid_to=None if confirmed is None else confirmed.valid_to,
+                                    source=proposal.source, evidence=proposal.evidence,
+                                    confidence=proposal.confidence,
+                                    topic=self.store.existing_topic(proposal.topic))
+        return result
 
     def _check_still_valid(self, proposal: Proposal, current: Dict[str, Any]) -> str:
         """Return how to apply the proposal now, or raise if it is stale.

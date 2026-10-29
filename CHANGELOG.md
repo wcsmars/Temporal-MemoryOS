@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0
+
+- Add optional Claude Agent SDK support through `memoryos agent` and the async Python `agent.ask` function. The SDK manages model calls and tool execution; memory access uses the existing three read-only MCP tools. Turn, budget and time limits are configurable, with built-in tools, external MCP configuration and saved conversations disabled.
+- Approval validation and fact writes now share a transaction, preventing a concurrent direct write from changing the reviewed state before approval. Nested writes roll back their Markdown files together with SQLite changes.
+- An open store rejects a replacement symlink for its memory folder and rejects nonregular Markdown files, including named pipes that could otherwise block reads. Failed refresh transactions are rolled back.
+- Graph and hybrid retrieval handle entity names made only of symbols. Invalid numeric output from a learned embedding provider is reported as an embedding failure.
+- Git checkpoints refuse nested repositories and gitlinks instead of silently omitting their fact contents.
+- Mutation summaries refuse to publish a score when any mutant has no associated tests or was skipped, including a cached resume that lost its test mappings.
+- Add regression tests, SDK boundary tests, and SDK dependency installation to CI. Benchmark figures from 0.2.3 remain pinned; current validation is reported separately.
+
 ## 0.2.4
 
 - On Linux with Python 3.14, which can load JSON nested more deeply than it can write back, such a proposal file is reported as a damaged file like any other; before, it stopped the whole proposal listing (and the CLI command or HTTP request that listed proposals).

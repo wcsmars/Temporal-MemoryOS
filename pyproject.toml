@@ -28,6 +28,7 @@ Changelog = "https://github.com/wcsmars/Temporal-MemoryOS/blob/main/CHANGELOG.md
 [project.optional-dependencies]
 api = ["fastapi>=0.115,<1", "pydantic>=2.8,<3", "uvicorn>=0.30,<1"]
 mcp = ["mcp>=1.28,<2"]
+agent = ["claude-agent-sdk>=0.2.174,<0.3", "mcp>=1.28,<2"]
 # torch 2.6 made weights-only loading the default, so model files cannot run code on load.
 # Intel Macs have no torch builds after 2.2; there the library's own default applies.
 semantic = [
@@ -76,6 +77,10 @@ strict_equality = true
 
 [[tool.mypy.overrides]]
 module = ["sentence_transformers", "sentence_transformers.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["claude_agent_sdk", "claude_agent_sdk.*"]
 ignore_missing_imports = true
 
 [tool.coverage.run]

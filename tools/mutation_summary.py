@@ -327,7 +327,8 @@ def main() -> int:
         return 1
     # After a run that stopped early, for example because the tests failed before
     # any mutant was tried, mutmut lists the mutants it did not check and exits 0.
-    unchecked = statuses["not checked"] + len(interrupted)
+    unchecked = (statuses["not checked"] + statuses["no tests"] + statuses["skipped"]
+                 + len(interrupted))
     if unchecked:
         print("The mutmut run did not finish: {} of {} mutants were not checked, so there is "
               "no score.\nCheck that the tests pass, then rerun: "
@@ -335,6 +336,13 @@ def main() -> int:
         if interrupted:
             print("Interrupted mutants are checked again only when named: "
                   "HYPOTHESIS_PROFILE=mutation mutmut run {}".format(" ".join(interrupted)),
+                  file=sys.stderr)
+        if statuses["skipped"]:
+            print("Skipped mutants were not executed; explicitly rerun or document their "
+                  "exclusion before using a score.", file=sys.stderr)
+        if statuses["no tests"]:
+            print("Some mutants had no associated tests. Recollect test mappings and explicitly "
+                  "rerun those mutants; a cached resume can preserve the untested statuses.",
                   file=sys.stderr)
         return 1
     caught = statuses["killed"] + statuses["timeout"]

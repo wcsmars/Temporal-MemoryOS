@@ -143,10 +143,10 @@ class SentenceTransformerEmbedder:
                 vectors = self._model.encode(
                     list(texts), normalize_embeddings=True, show_progress_bar=False,
                 )
+                return [[float(value) for value in row] for row in vectors]
             except Exception as error:
                 raise EmbeddingUnavailableError("The embedding model failed: {}: {}".format(
                     type(error).__name__, error)) from error
-        return [[float(value) for value in row] for row in vectors]
 
     def _load(self) -> None:
         try:

@@ -149,12 +149,6 @@ class GitHistory:
         self._adopt()
         return {"initialized": True, "root": str(self.root)}
 
-    @staticmethod
-    def _publishable(name: str) -> bool:
-        # Dot files are editor locks, swap files or interrupted writes; the
-        # store ignores them too.
-        return bool(name) and not any(part.startswith(".") for part in name.split("/"))
-
     def checkpoint(self, message: str) -> dict:
         if not message.strip():
             raise ValueError("A non-empty checkpoint message is required.")
@@ -165,9 +159,19 @@ class GitHistory:
             if path.is_symlink() or (path.exists() and not path.is_dir()):
                 raise ValueError(f"Checkpoint target {name!r} must be a directory.")
             if path.exists():
-                if any(entry.is_symlink() for entry in path.rglob("*")
-                       if self._publishable(entry.relative_to(self.root).as_posix())):
-                    raise ValueError("Checkpoint directories cannot contain symbolic links.")
+                # Git stages an embedded repository as a gitlink, not its files.
+                # Refuse it rather than claiming to have checkpointed its facts.
+                # Prune hidden folders just as the store does, including .git.
+                for folder, directories, files in os.walk(path, followlinks=False):
+                    # Use the filesystem's spelling rules, as Git does: .GIT is
+                    # also .git on a case-insensitive disk.
+                    if os.path.lexists(os.path.join(folder, ".git")):
+                        raise ValueError("Checkpoint directories cannot contain nested Git "
+                                         "repositories; move them outside the memory directory.")
+                    for entry in directories + files:
+                        if not entry.startswith(".") and (Path(folder) / entry).is_symlink():
+                            raise ValueError("Checkpoint directories cannot contain symbolic links.")
+                    directories[:] = [entry for entry in directories if not entry.startswith(".")]
             targets.append(name)
         # Check the effective identity before altering the index. Environment identities
         # are supported; missing identity is never guessed or written to Git config.
@@ -190,6 +194,12 @@ class GitHistory:
                 return self._commit(message, targets)
 
     def _commit(self, message: str, targets: List[str]) -> dict:
+        # Also catch gitlinks already in the index, including uninitialized
+        # submodules whose checkout no longer has a .git marker.
+        entries = self._git("ls-files", "--stage", "-z", "--", *targets).stdout.split("\x00")
+        if any(entry.startswith("160000 ") for entry in entries):
+            raise ValueError("Checkpoint directories cannot contain Git submodules; remove "
+                             "their gitlinks from the index before checkpointing.")
         # Stage whole folders: the repository's exclude rules keep locks, temporary
         # and dot files out. Per-file pathspecs would cost time quadratic in the
         # number of records.

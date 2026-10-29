@@ -71,7 +71,7 @@ Only structured canonical blocks are indexed. Ordinary prose notes do not become
 
 Topic paths are confined to the memory tree; symlinked records, folders and index files are rejected. The HTTP API only answers requests addressed to localhost unless other host names are configured. FTS query tokens are quoted, and SQL uses parameters. Approval files use separate serialization and a POSIX lock. This is a local application, not a hardened hostile multi-user filesystem. Backups, filesystem permissions, and encryption remain the operator's responsibility.
 
-There is no cross-file transaction combining a newly written fact and its proposal approval status. Approving again after an interruption recognizes the fact that was already written (same value, date, source, evidence, confidence and topic, not already claimed by an approved proposal that states the same thing) and marks the proposal approved. Rejecting such a proposal is refused while its fact is unrevised and no other pending proposal stating the same line (its topic in another letter case) can claim it, because the fact would stay; approve it to finish, then retract the fact if it is wrong. Once the fact has been retracted or corrected, the proposal can be rejected. Git checkpoints hold the proposal lock and the store's write lock while staging, so a commit never contains one without the other. Git is explicit opt-in and does not erase retracted evidence.
+There is no cross-file transaction combining a newly written fact and its proposal approval status. Approving again after an interruption recognizes the fact that was already written (same value, date, source, evidence, confidence and topic, not already claimed by an approved proposal that states the same thing) and marks the proposal approved. Rejecting such a proposal is refused while its fact is unrevised and no other pending proposal stating the same line (its topic in another letter case) can claim it, because the fact would stay; approve it to finish, then retract the fact if it is wrong. Once the fact has been retracted or corrected, the proposal can be rejected. Git checkpoints hold the proposal lock and the store's write lock while staging, so a commit cannot interleave an in-flight approval between its fact write and status save; an interrupted approval can still leave a fact with a pending proposal, which retry recovery handles. Git is explicit opt-in and does not erase retracted evidence.
 
 ## Modules
 
@@ -82,7 +82,23 @@ There is no cross-file transaction combining a newly written fact and its propos
 | `extraction.py` | Rule extraction, proposals, human approval |
 | `embeddings.py` | Offline hashing and optional learned provider |
 | `retrieval.py` | Snapshot filtering, ranking, links, citations |
+| `agent.py` | Optional SDK-managed model/tool execution with read-only memory tools |
 | `git_history.py` | Local checkpoint isolation |
 | `cli.py` | JSON command-line interface |
 | `api.py` | Optional FastAPI service |
 | `mcp_server.py` | Optional SDK-managed read-only stdio tools |
+
+## Optional agent execution
+
+`agent.py` delegates each question to the Claude Agent SDK's `query`. It consumes
+SDK messages and returns the terminal answer; it does not schedule model calls or
+dispatch tools itself. The SDK starts the existing local MCP server using the same
+Python interpreter. Only search, fetch, and memory_history are exposed. The agent
+uses a temporary working directory, explicit tool permissions, no inherited settings
+or MCP servers, and no conversation persistence. AnyIO cancellation lets the SDK
+clean up subprocesses when the timeout expires. Provider errors are sanitized.
+
+This integration reads memory and can update the disposable index during reads.
+It cannot approve or write facts through its tools. The question and retrieved data
+are sent to the configured model provider. Dates are model instructions; the MCP
+server remains a read-only audit interface, not a date-based authorization boundary.

@@ -349,9 +349,11 @@ class HybridRetriever:
             facts = [fact for fact in facts if _name(fact.entity) == wanted]
         semantic = getattr(self.embedder, "semantic", True)
         has_words = bool(tokenize(query))
-        # A learned model can match a query with no word tokens (emoji, symbols).
-        if not facts or not (has_words or (semantic and query.strip()
-                                            and mode in ("semantic", "hybrid"))):
+        # A learned model can match symbols, and graph search can name an entity
+        # made entirely of symbols. Hashing and keyword search still need words.
+        graph = mode in ("graph", "hybrid") and bool(query.strip())
+        if not facts or not (has_words or graph or (semantic and query.strip()
+                                                   and mode in ("semantic", "hybrid"))):
             return []
 
         channels: Dict[str, Ranking] = {}
@@ -362,9 +364,9 @@ class HybridRetriever:
         keep = _named_words(query, facts) if keyword or lexical else set()
         if keyword:
             channels["keyword"] = self._keyword(query, facts, keep)
-        if mode in ("semantic", "hybrid"):
+        if mode in ("semantic", "hybrid") and (semantic or has_words):
             channels[self.embedding_channel] = self._embedding(query, facts, keep)
-        if mode in ("graph", "hybrid") and has_words:
+        if graph:
             channels["graph"] = self._graph(query, facts)
 
         raw_scores: Dict[str, Dict[str, float]] = {}
