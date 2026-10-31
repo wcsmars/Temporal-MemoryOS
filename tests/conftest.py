@@ -21,10 +21,22 @@ variables. Git also stops looking for a repository at pytest's base temp
 folder. A global ``commit.gpgsign``, hook directory, exported ``GIT_DIR`` or
 a TMPDIR inside a Git checkout therefore cannot change a test's outcome.
 Tests that need a Git identity set one themselves.
+
+During a mutation run, each test session also deletes its own base temp folder
+when it ends. mutmut 3.8 ends every worker process with ``os._exit``, so
+pytest's exit-time cleanup never runs: each mutant would leave a locked
+``pytest-N`` folder behind, which later pytest runs leave alone for three
+days, and the folders left by runs of about 4,000 mutants filled the disk.
+mutmut sets ``MUTANT_UNDER_TEST`` for every test run it starts (to an empty
+value for its clean run), so a session counts as a mutation run when that
+variable is set. A worker that mutmut kills, for example at its time limit,
+still leaves its folder. Other runs keep pytest's default of the three
+newest folders, and a folder given with ``--basetemp`` is left to pytest.
 """
 
 import itertools
 import os
+import shutil
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -80,3 +92,15 @@ def isolated_environment(monkeypatch, tmp_path_factory):
     # Git stops looking for a repository at pytest's base temp folder, so a
     # TMPDIR inside a Git checkout does not put every test inside that checkout.
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path_factory.getbasetemp().resolve()))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def mutation_run_temp_cleanup(request, tmp_path_factory):
+    """Delete this session's base temp folder at the end of a session mutmut started."""
+    mutation_run = "MUTANT_UNDER_TEST" in os.environ
+    if not mutation_run or request.config.getoption("basetemp") is not None:
+        yield
+        return
+    basetemp = tmp_path_factory.getbasetemp()
+    yield
+    shutil.rmtree(basetemp, ignore_errors=True)

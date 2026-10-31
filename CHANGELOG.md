@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Mutation runs no longer fill the disk with pytest temporary folders. `mutmut` ends each test worker with `os._exit`, which skips pytest's exit-time cleanup, so every mutant left a folder behind. A test session that mutmut starts now deletes its own base temporary folder when it ends; other test runs are unchanged.
+
 ## 0.3.0
 
 - Add optional Claude Agent SDK support through `memoryos agent` and the async Python `agent.ask` function. The SDK manages model calls and tool execution; memory access uses the existing three read-only MCP tools. Turn, budget and time limits are configurable, with built-in tools, external MCP configuration and saved conversations disabled.

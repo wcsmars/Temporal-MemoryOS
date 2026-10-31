@@ -3,8 +3,9 @@
 Surviving mutants showed that these could change without any other test
 failing: the JSON shape of search results, the key order of Markdown records
 and proposal files, default arguments, folder and file names, and the guards
-of the proposal queue. One test checks that conftest.py keeps the Git tests
-working when the temporary folder is inside a Git checkout. The last tests
+of the proposal queue. Two tests check conftest.py: it keeps the Git tests
+working when the temporary folder is inside a Git checkout, and a test session
+that mutmut starts deletes its base temp folder when it ends. The last tests
 check the rule that tools/mutation_summary.py uses to set aside survivors
 that only change the text of a message or the letter case of SQL keywords,
 and that it gives no score for an unfinished run.
@@ -298,6 +299,73 @@ def test_git_tests_pass_with_the_temp_folder_inside_a_git_checkout(tmp_path):
         cwd=repository, env=environment, capture_output=True, text=True, timeout=120,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+# Runs pytest the way a mutmut worker does: in its own process, stopping at the first
+# failure, and ending with os._exit, so pytest's exit-time cleanup never runs.
+MUTMUT_WORKER = "import os, sys, pytest; os._exit(int(pytest.main(sys.argv[1:])))"
+MUTANT = "pkg.x_add__mutmut_1"
+PROBE_TEST = """
+import os
+from pathlib import Path
+
+def test_probe(tmp_path):
+    (tmp_path / "data.txt").write_text("synthetic")
+    Path(os.environ["PROBE_RECORD"]).write_text(str(tmp_path))
+    assert "PROBE_FAIL" not in os.environ
+"""
+# A test in a second module, so the session goes on after the probe's module ends.
+LATER_TEST = "def test_after_probe():\n    pass\n"
+
+
+@pytest.mark.parametrize("mutant, failing, basetemp, kept", [
+    (MUTANT, False, False, False), (MUTANT, True, False, False), ("", False, False, False),
+    (None, False, False, True), (MUTANT, False, True, True),
+], ids=["surviving-mutant", "killed-mutant", "clean-run", "ordinary-run", "chosen-basetemp"])
+def test_a_mutation_run_deletes_its_temp_folder(tmp_path, mutant, failing, basetemp, kept):
+    """A session that mutmut starts, marked by MUTANT_UNDER_TEST (empty for its clean run),
+    deletes its base temp folder as it ends, whether its tests pass or fail, although the
+    worker then skips pytest's own cleanup. Another worker's folder, the folder of a session
+    mutmut did not start, and a folder chosen with --basetemp are left alone."""
+    repository = Path(__file__).resolve().parents[1]
+    project = tmp_path / "project"
+    (project / "tests").mkdir(parents=True)
+    shutil.copy(repository / "tests" / "conftest.py", project / "tests")
+    (project / "tests" / "test_probe.py").write_text(PROBE_TEST)
+    (project / "tests" / "test_probe_later.py").write_text(LATER_TEST)
+    # Its own config file, so the child ignores pytest settings in the folders above it.
+    (project / "pytest.ini").write_text("[pytest]\n")
+    root = tmp_path / "temproot"
+    # The child's user name, which pytest puts in its folder name. getpass reads LOGNAME
+    # first, so setting it avoids a lookup that can fail.
+    user = "probe"
+    # The session folder of another worker running at the same time, which must survive.
+    other = root / "pytest-of-{}".format(user) / "pytest-99"
+    other.mkdir(parents=True)
+    (other / ".lock").touch()
+    record = tmp_path / "record.txt"
+    environment = os.environ.copy()
+    for name in ("MUTANT_UNDER_TEST", "PROBE_FAIL", "PYTEST_ADDOPTS", "PYTEST_DEBUG_TEMPROOT"):
+        environment.pop(name, None)
+    if mutant is not None:
+        environment["MUTANT_UNDER_TEST"] = mutant
+    if failing:
+        environment["PROBE_FAIL"] = "1"
+    # Unbuffered output keeps the child's report, which os._exit would otherwise drop.
+    environment.update(PYTHONPATH=str(repository / "src"), PYTHONUNBUFFERED="1",
+                       LOGNAME=user, TMPDIR=str(root), HYPOTHESIS_PROFILE="mutation",
+                       PROBE_RECORD=str(record))
+    arguments = ["-x", "-q", "-p", "no:cacheprovider", "tests"]
+    if basetemp:
+        arguments += ["--basetemp", str(root / "chosen")]
+    completed = subprocess.run([sys.executable, "-c", MUTMUT_WORKER, *arguments],
+                               cwd=project, env=environment, capture_output=True, text=True,
+                               timeout=120)
+    assert completed.returncode == (1 if failing else 0), completed.stdout + completed.stderr
+    session_folder = Path(record.read_text()).parent
+    assert root.resolve() in session_folder.parents
+    assert session_folder.exists() == kept
+    assert (other / ".lock").exists()
 
 
 # tools/mutation_summary.py
