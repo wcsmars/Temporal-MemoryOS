@@ -42,7 +42,8 @@ class GitHistory:
     """Never stages a parent repository, pushes, or changes global Git settings."""
 
     def __init__(self, root: str | Path):
-        self.root = Path(root).expanduser().resolve()
+        from .store import _resolved_root
+        self.root = _resolved_root(root)
 
     def _git(self, *arguments: str, check: bool = True, stdin: Optional[str] = None
              ) -> subprocess.CompletedProcess:
@@ -119,6 +120,10 @@ class GitHistory:
             return False
 
     def _require_own_repository(self) -> None:
+        # A missing folder is reported, not "run git-init": that would start a
+        # new, empty memory at the old path.
+        from .store import _require_root
+        _require_root(self.root)
         toplevel = self._toplevel()
         if not self._is_root(toplevel):
             raise ValueError("This memory directory needs its own repository. Run git-init first.")
@@ -129,7 +134,29 @@ class GitHistory:
                 "<memory directory> config memoryos.checkpoints true")
 
     def initialize(self) -> dict:
-        self.root.mkdir(parents=True, exist_ok=True)
+        from .store import MissingMemoryDirectoryError, _create_root, _require_root
+        made: List[Path] = []
+        try:
+            _require_root(self.root)
+        except MissingMemoryDirectoryError:
+            # The folder and the parents it needs, deepest first.
+            missing = [folder for folder in (self.root, *self.root.parents)
+                       if not os.path.lexists(folder)]
+            # A set-up command, like init: private to its owner.
+            if _create_root(self.root):
+                made = missing
+        try:
+            return self._initialize()
+        except BaseException:
+            # Only while still empty: once Git has made .git, it stays.
+            for folder in made:
+                try:
+                    folder.rmdir()
+                except OSError:
+                    break
+            raise
+
+    def _initialize(self) -> dict:
         toplevel = self._toplevel()
         if toplevel is not None:
             if not self._is_root(toplevel):
@@ -187,7 +214,7 @@ class GitHistory:
         # and searches go on meanwhile; writes and approvals wait for it.
         from .extraction import ProposalQueue
         from .store import MemoryStore
-        with MemoryStore(self.root) as store:
+        with MemoryStore(self.root, create=False) as store:
             queue = ProposalQueue(store)
             with queue._lock(), store._transaction():
                 self._adopt()  # Inside the locks, so checkpoints never race on it.

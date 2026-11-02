@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple, Union
@@ -73,6 +74,35 @@ def normalize_time(value: TimeInput = None) -> str:
     except OverflowError as exc:
         raise ValueError("Time is outside the supported range: {!r}".format(value)) from exc
     return utc.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+# One wording for every interface's as_of and known_at help. A date alone is
+# easily read as the whole local day, which hides facts recorded later that day.
+_DATE_ALONE = "A date alone means 00:00 UTC at the start of that day."
+_DATE_RULE = (
+    _DATE_ALONE[:-1] + ", not the whole day and not local time. For the end of a local "
+    "day, pass a timestamp with a UTC offset, such as 2026-11-01T23:59:59.999999+08:00; "
+    "leave the cutoff out to mean now.")
+_AS_OF_HELP = "When the facts were true. " + _DATE_RULE
+_KNOWN_AT_HELP = "Use only facts recorded by this time. " + _DATE_RULE
+
+
+_DOTTED_I = re.compile("i\u0307+")
+
+
+def name_key(text: str) -> str:
+    """The form in which entity and attribute names are compared.
+
+    Letter case, Unicode compatibility forms (such as full-width letters and
+    ligatures) and surrounding or repeated spaces do not count, so "User",
+    "USER" and " user " are one name. Case folding is Unicode's default ("ß"
+    matches "SS"); it turns the Turkish "İ" into "i" and a dot above, and the
+    dot is dropped so that "İstanbul" matches "Istanbul".
+    """
+    # Every dot above after an i goes: one more after a Turkish "İ" must not
+    # survive into the key, or the key of a key would differ from the key.
+    folded = _DOTTED_I.sub("i", unicodedata.normalize("NFKC", text).casefold())
+    return " ".join(unicodedata.normalize("NFKC", folded).split())
 
 
 def validate_topic(topic: str) -> str:

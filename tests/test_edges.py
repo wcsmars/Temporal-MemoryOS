@@ -269,6 +269,9 @@ def run(capsys, root, *arguments):
 def test_cli_covers_the_record_lifecycle(tmp_path, capsys, monkeypatch):
     monkeypatch.delenv("MEMORYOS_EMBEDDING_MODEL", raising=False)
     root = tmp_path / "memory-store"
+    assert run(capsys, root, "add", "Acme application", "status", "pending")[0] == 1
+    assert not root.exists()  # Only init and demo create a memory directory.
+    assert run(capsys, root, "init")[1]["facts"] == 0
     code, added, _ = run(capsys, root, "add", "Acme application", "status", "pending",
                          "--from", "2025-01-01", "--tag", "career", "--link", "Acme",
                          "--topic", "career/applications", "--evidence", "Synthetic.")

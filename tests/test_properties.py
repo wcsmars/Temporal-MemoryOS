@@ -35,7 +35,7 @@ from hypothesis.stateful import (
 )
 
 from temporal_memory_os.embeddings import HashingEmbedder
-from temporal_memory_os.extraction import ProposalQueue
+from temporal_memory_os.extraction import _LIST_MARKER, _TASK_BOX, ProposalQueue
 from temporal_memory_os.models import Fact, normalize_time
 from temporal_memory_os.retrieval import HybridRetriever
 from temporal_memory_os.store import MemoryConflictError, MemoryStore
@@ -419,7 +419,12 @@ LINE_TEXT = st.text(
        day=st.sampled_from(DAYS))
 def test_structured_lines_become_exactly_one_reviewable_proposal(tmp_path_factory, entity,
                                                                  attribute, value, day):
-    assume(not entity.strip().startswith("#"))
+    # A comment, and a byte-order mark at a line start (where joined files leave one),
+    # are not part of a statement.
+    assume(not entity.strip().startswith(("#", "\ufeff")))
+    # A list marker or a to-do box at the start of a line is not part of the name.
+    start = entity.strip() + " "
+    assume(not _LIST_MARKER.match(start) and not _TASK_BOX.match(start))
     with MemoryStore(tmp_path_factory.mktemp("extract")) as store:
         queue = ProposalQueue(store)
         line = "{} | {} | {} | {}".format(entity, attribute, value, day)

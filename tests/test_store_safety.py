@@ -238,7 +238,8 @@ def test_a_corrupt_index_is_set_aside_and_rebuilt_only_on_request(tmp_path):
     garbage = bytes(range(256)) * 16
     _index(tmp_path).write_bytes(garbage)
     for _ in range(2):  # Opening again changes nothing either.
-        with pytest.raises(StoreIntegrityError, match="memoryos reindex") as caught:
+        with pytest.raises(StoreIntegrityError,
+                           match="memoryos --root <memory directory> reindex") as caught:
             MemoryStore(tmp_path)
         assert "file is not a database" in str(caught.value)
         assert str(tmp_path.resolve()) not in str(caught.value)
@@ -285,7 +286,8 @@ def test_an_index_damaged_past_its_header_is_reported_then_repaired_on_request(t
     _index(tmp_path).write_bytes(bytes(data))
     with closing(_raw(tmp_path)) as connection:  # The header and schema still read fine.
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
-    with pytest.raises(StoreIntegrityError, match="memoryos reindex") as caught:
+    with pytest.raises(StoreIntegrityError,
+                       match="memoryos --root <memory directory> reindex") as caught:
         MemoryStore(tmp_path)
     assert "malformed" in str(caught.value)
     assert _set_aside(tmp_path) == []
@@ -363,7 +365,8 @@ def test_a_damaged_column_name_is_reported_as_damage_and_left_in_place(tmp_path,
     try:
         store = MemoryStore(tmp_path)
     except StoreIntegrityError as error:  # The damaged column is read on opening.
-        assert "run `memoryos reindex`" in str(error) and "no such column" in str(error)
+        assert "`memoryos --root <memory directory> reindex`" in str(error)
+        assert "no such column" in str(error)
     else:
         # Reading fails on a damaged payload column; writing, on any column of facts.
         with store, pytest.raises(sqlite3.DatabaseError) as caught:
@@ -438,7 +441,7 @@ def test_a_damaged_record_payload_in_the_index_gets_the_repair_hint(tmp_path, ol
             message = str(caught.value)
             assert message.startswith("The index .memoryos/index.sqlite3 is damaged (record "
                                       + fact.id + " cannot be read: " + cause)
-            assert "run `memoryos reindex`" in message
+            assert "`memoryos --root <memory directory> reindex`" in message
         assert _records(tmp_path) == [fact.id + ".md"]  # The refused write left nothing.
         assert store.reindex() == 1  # Rebuilt from Markdown, without setting anything aside.
         assert store.get(fact.id) == fact

@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-from .models import Fact, TimeInput, normalize_time
+from .models import Fact, TimeInput, name_key, normalize_time
 
 _MARKER = "<!-- memoryos:fact:v1 -->"
 _MARKER_BYTES = _MARKER.encode("utf-8")
@@ -52,9 +52,15 @@ _TABLE_COLUMNS = {
 }
 
 
+def _marks(values: Sequence[str]) -> str:
+    """The placeholders of an SQL ``IN`` list."""
+    return ", ".join("?" * len(values))
+
+
 def _bounded(fact: Fact, end: Optional[str]) -> Fact:
     """Copy a validated record with a derived end; the end is already normalized
-    and later than ``valid_from`` because equal starts are rejected on write."""
+    and later than ``valid_from``: equal starts are rejected on write, and a
+    timeline drops a record whose start another spelling of its names took later."""
     if end == fact.valid_to:
         return fact
     bounded = copy.copy(fact)
@@ -68,6 +74,65 @@ class MemoryConflictError(ValueError):
 
 class StoreIntegrityError(ValueError):
     """The Markdown records or the index on disk need repair; the request was fine."""
+
+
+class MissingMemoryDirectoryError(StoreIntegrityError):
+    """The memory directory does not exist: it was moved, renamed or deleted, or never made."""
+
+
+_MISSING_DIRECTORY = ("Memory directory is missing (moved, renamed or deleted?); move it back, "
+                      "or run memoryos init with the same --root or MEMORYOS_HOME to start a "
+                      "new, empty memory")
+_NOT_A_FOLDER = "The memory directory path exists but is not a folder"
+
+
+def _resolved_root(root: Union[str, Path]) -> Path:
+    """``root`` made absolute, with its symbolic links resolved. Errors never name the path.
+
+    Python 3.10 to 3.12 report a loop of links as RuntimeError("Symlink loop from
+    <path>"); 3.13 and later resolve what they can, and _require_root reports the loop.
+    """
+    path = Path(root).expanduser()
+    try:
+        return path.resolve()
+    except RuntimeError:
+        raise OSError(errno.ELOOP, "Cannot open the memory directory: {}".format(
+            os.strerror(errno.ELOOP))) from None
+
+
+def _require_root(root: Path) -> None:
+    """Raise unless the memory directory exists and is a folder. Errors never name the path.
+
+    One ``os.stat`` rather than ``Path.exists()`` or ``Path.is_dir()``: depending on
+    the Python version, those raise an error naming the path, or answer False, when a
+    parent folder cannot be searched, and a folder that is there would read as missing.
+    """
+    try:
+        mode = os.stat(str(root)).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        raise MissingMemoryDirectoryError(_MISSING_DIRECTORY) from None
+    except OSError as error:
+        raise OSError(error.errno, "Cannot open the memory directory: {}".format(
+            error.strerror)) from None
+    if not stat.S_ISDIR(mode):
+        raise StoreIntegrityError(_NOT_A_FOLDER)
+
+
+def _create_root(root: Path) -> bool:
+    """Create a missing memory directory, private to its owner, and any missing parents.
+
+    Return False if another process created it first. Errors never name the path.
+    """
+    try:
+        root.mkdir(mode=0o700, parents=True)
+    except FileExistsError:
+        if root.is_dir():
+            return False
+        raise StoreIntegrityError(_NOT_A_FOLDER) from None
+    except OSError as error:
+        raise OSError(error.errno, "Cannot create the memory directory: {}".format(
+            error.strerror)) from None
+    return True
 
 
 def _shift(timestamp: str, delta: timedelta) -> str:
@@ -146,9 +211,13 @@ def _damaged(error: sqlite3.Error) -> bool:
             or _missing_column(error))
 
 
+# Also shown by the CLI, the HTTP API and the MCP tools, so it names no path. Without
+# --root, reindex would rebuild the default directory (./memory-data or MEMORYOS_HOME).
 _DAMAGED_INDEX = ("The index .memoryos/index.sqlite3 is damaged ({}). Stop other programs using "
-                  "this memory directory and run `memoryos reindex` to rebuild it from the "
-                  "Markdown records.")
+                  "this memory directory, then rebuild the index from the Markdown records by "
+                  "running reindex with --root set to this memory directory (the same --root or "
+                  "MEMORYOS_HOME used to open it), for example "
+                  "`memoryos --root <memory directory> reindex`.")
 
 
 class MemoryStore:
@@ -170,17 +239,42 @@ class MemoryStore:
     is set aside and rebuilt instead, since everything in it is derived from
     Markdown. Repair renames database files, so it is never done implicitly
     while other processes may be using them.
+
+    A missing memory directory is created (mode 0700) and ``created`` is set,
+    so callers can say so. With ``create=False`` it raises
+    :class:`MissingMemoryDirectoryError` instead: a folder that was moved or
+    renamed must not be replaced by an empty one without a word. An existing
+    folder without ``memory/`` is an empty memory either way.
     """
 
-    def __init__(self, root: Union[str, Path], repair_index: bool = False):
-        self.root = Path(root).expanduser().resolve()
+    def __init__(self, root: Union[str, Path], repair_index: bool = False, *,
+                 create: bool = True):
+        self.root = _resolved_root(root)
         self.memory_dir = self.root / "memory"
         self.state_dir = self.root / ".memoryos"
-        # The folders on disk need attention, not the caller's request.
-        if self.memory_dir.is_symlink() or self.state_dir.is_symlink():
-            raise StoreIntegrityError("Memory and index folders must not be symbolic links")
-        self.memory_dir.mkdir(parents=True, exist_ok=True)
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.created = False
+        try:
+            _require_root(self.root)
+        except MissingMemoryDirectoryError:
+            if not create:
+                raise
+            self.created = _create_root(self.root)
+        try:
+            # The folders on disk need attention, not the caller's request.
+            if self.memory_dir.is_symlink() or self.state_dir.is_symlink():
+                raise StoreIntegrityError("Memory and index folders must not be symbolic links")
+            for folder in (self.memory_dir, self.state_dir):
+                try:
+                    # Without parents: a directory moved away since the check stays away.
+                    folder.mkdir(exist_ok=True)
+                except FileExistsError:
+                    raise StoreIntegrityError("{}/ in the memory directory is not a folder".format(
+                        folder.name)) from None
+        except FileNotFoundError:
+            raise MissingMemoryDirectoryError(_MISSING_DIRECTORY) from None
+        except OSError as error:  # Such as a read-only folder; the message names no path.
+            raise OSError(error.errno, "Cannot open the memory directory: {}".format(
+                error.strerror)) from None
         self.db_path = self.state_dir / "index.sqlite3"
         if any(Path(str(self.db_path) + suffix).is_symlink() for suffix in ("", "-wal", "-shm")):
             raise StoreIntegrityError("The index database must not be a symbolic link")
@@ -188,6 +282,8 @@ class MemoryStore:
         # Parsed records keyed by ID. The stored payload is compared on every
         # hit, so a rebuild by another process can never serve a stale record.
         self._parsed: Dict[str, Tuple[str, Fact]] = {}
+        # Stored entity names by name_key, with the SQLite data_version they were read at.
+        self._entity_names: Optional[Tuple[int, Dict[str, List[str]]]] = None
         self._undo: List[Callable[[], None]] = []
         self._transaction_depth = 0
         self._rollback_only = False
@@ -383,6 +479,7 @@ class MemoryStore:
                     # behind to be reimported by the next refresh.
                     for undo in reversed(self._undo):
                         undo()
+                    self._entity_names = None  # It may list names that were rolled back.
                 raise
             finally:
                 self._transaction_depth -= 1
@@ -529,8 +626,15 @@ class MemoryStore:
         matches = list(_BLOCK.finditer(text))
         if len(matches) != 1 or len(markers) != 1:
             raise ValueError("{}: expected one canonical memory JSON block".format(path.as_posix()))
+        block = matches[0]
         try:
-            return Fact.from_dict(json.loads(matches[0].group(1)))
+            return Fact.from_dict(json.loads(block.group(1)))
+        except json.JSONDecodeError as exc:
+            # json counts lines from the start of the block; an editor counts from the top
+            # of the file. The block starts a line, and every line ending is now one "\n".
+            line = text.count("\n", 0, block.start(1)) + exc.lineno
+            raise ValueError("{}: {}: line {} column {}".format(
+                path.as_posix(), exc.msg, line, exc.colno)) from exc
         except (ValueError, TypeError, RecursionError) as exc:  # Deep nesting: RecursionError.
             raise ValueError("{}: {}".format(path.as_posix(), exc)) from exc
 
@@ -611,8 +715,8 @@ class MemoryStore:
                 raise ValueError("Missing superseded record: " + fact.supersedes + where(fact.id))
             old = by_id[fact.supersedes]
             if (fact.entity, fact.attribute, fact.valid_from) != (old.entity, old.attribute, old.valid_from):
-                raise ValueError("Corrections must retain entity, attribute, and valid_from"
-                                 + where(fact.id, old.id))
+                raise ValueError("Corrections must retain entity, attribute, and valid_from "
+                                 "exactly, including letter case" + where(fact.id, old.id))
             if fact.recorded_at < old.recorded_at:
                 raise ValueError("A correction cannot be recorded before the assertion it corrects"
                                  + where(fact.id, old.id))
@@ -645,8 +749,14 @@ class MemoryStore:
         values.extend([path.relative_to(self.root).as_posix(), json.dumps(data, ensure_ascii=False)])
         self.connection.execute("INSERT INTO facts ({}, path, payload) VALUES ({})".format(
             ", ".join(_COLUMNS), ", ".join("?" for _ in values)), values)
+        if self._entity_names is not None:
+            # This connection's own writes leave data_version unchanged.
+            spellings = self._entity_names[1].setdefault(name_key(fact.entity), [])
+            if fact.entity not in spellings:
+                spellings.append(fact.entity)
 
     def _replace_index(self, records: List[Tuple[Fact, Path]], sources: List[tuple]) -> None:
+        self._entity_names = None
         self.connection.execute("DELETE FROM facts")
         self.connection.execute("DELETE FROM sources")
         for fact, path in records:
@@ -722,6 +832,96 @@ class MemoryStore:
             "SELECT id, payload FROM facts WHERE entity = ? AND attribute = ?", (entity, attribute))
         return [self._fact(row) for row in rows]
 
+    def _entity_spellings(self, entity: str) -> List[str]:
+        """Every stored spelling of ``entity`` (see name_key). The names are read once and
+        kept until another connection commits, which changes SQLite's data_version."""
+        if not isinstance(entity, str):
+            return []
+        version = self.connection.execute("PRAGMA data_version").fetchone()[0]
+        if self._entity_names is None or self._entity_names[0] != version:
+            names: Dict[str, List[str]] = {}
+            for row in self.connection.execute("SELECT DISTINCT entity FROM facts"):
+                names.setdefault(name_key(row[0]), []).append(row[0])
+            self._entity_names = (version, names)
+        return list(self._entity_names[1].get(name_key(entity), ()))
+
+    def _spellings(self, entity: Optional[str], attribute: Optional[str] = None
+                   ) -> Tuple[List[str], List[str]]:
+        """Stored spellings of ``entity`` and, among their records, of ``attribute``.
+        Querying them with IN keeps the lookups on the facts_temporal index."""
+        entities = [] if entity is None else self._entity_spellings(entity)
+        if not isinstance(attribute, str) or (entity is not None and not entities):
+            return entities, []
+        if entity is None:
+            rows = self.connection.execute("SELECT DISTINCT attribute FROM facts")
+        else:
+            rows = self.connection.execute(
+                "SELECT DISTINCT attribute FROM facts WHERE entity IN ({})".format(
+                    _marks(entities)), entities)
+        wanted = name_key(attribute)
+        return entities, [row[0] for row in rows if name_key(row[0]) == wanted]
+
+    def _stored_names(self, entity: str, attribute: str) -> Tuple[Optional[str], Optional[str]]:
+        """The spelling memory uses for ``entity`` / ``attribute``, with None for a name
+        it does not have yet. A new record takes it, so it joins that history.
+
+        Names compare by name_key. A pair stored exactly as given is kept. Otherwise
+        both names come from the latest recorded matching record, so the record joins
+        under a pair already in use rather than a new mix. If only the entity is
+        stored, the given spelling is kept when stored, else taken the same way from
+        the entity's records, and the attribute is None.
+        """
+        with self._lock:
+            entities, attributes = self._spellings(entity, attribute)
+            if not entities:
+                return None, None
+            if attributes:
+                exact = self.connection.execute(
+                    "SELECT 1 FROM facts WHERE entity = ? AND attribute = ? LIMIT 1",
+                    (entity, attribute)).fetchone()
+                return (entity, attribute) if exact else self._latest_names(entities, attributes)
+            if entity in entities:
+                return entity, None
+            return self._latest_names(entities)[0], None
+
+    def _latest_names(self, entities: List[str],
+                      attributes: Optional[List[str]] = None) -> Tuple[str, str]:
+        """Names of the latest recorded record among those of ``entities`` (and of
+        ``attributes``), preferring records still in effect: neither retractions nor
+        revised since. A spelling that was retracted as a typo is therefore not reused
+        while another is in use. Both lists hold names that are stored."""
+        condition, parameters = "entity IN ({})".format(_marks(entities)), list(entities)
+        if attributes is not None:
+            condition += " AND attribute IN ({})".format(_marks(attributes))
+            parameters.extend(attributes)
+        rows = self.connection.execute(
+            "SELECT id, entity, attribute, deleted, supersedes FROM facts WHERE " + condition
+            + " ORDER BY recorded_at DESC, id DESC", parameters).fetchall()
+        revised = {row["supersedes"] for row in rows}
+        chosen = next((row for row in rows if not row["deleted"] and row["id"] not in revised),
+                      rows[0])
+        return str(chosen["entity"]), str(chosen["attribute"])
+
+    def _check_other_spellings(self, fact: Fact) -> None:
+        """Refuse a new assertion whose start an effective record in another spelling of
+        the same names already holds. Histories join by name_key, so it would hide that
+        record; the rule for one spelling is in _validate_collection."""
+        entities, attributes = self._spellings(fact.entity, fact.attribute)
+        if set(entities) <= {fact.entity} and set(attributes) <= {fact.attribute}:
+            return  # No other spelling (the usual case).
+        rows = self.connection.execute(
+            "SELECT id, entity, attribute, supersedes FROM facts WHERE entity IN ({}) "
+            "AND attribute IN ({}) AND valid_from = ?".format(_marks(entities), _marks(attributes)),
+            entities + attributes + [fact.valid_from]).fetchall()
+        superseded = {row["supersedes"] for row in rows}
+        for row in rows:
+            if (row["id"] not in superseded
+                    and (row["entity"], row["attribute"]) != (fact.entity, fact.attribute)):
+                raise MemoryConflictError(
+                    "Duplicate effective time for {} / {} (held by a record spelled {} / {}); "
+                    "use correct()".format(fact.entity, fact.attribute, row["entity"],
+                                           row["attribute"]))
+
     def _fact(self, row: sqlite3.Row) -> Fact:
         payload = row["payload"]
         cached = self._parsed.get(row["id"])
@@ -792,6 +992,8 @@ class MemoryStore:
         if self._indexed(fact.id) is not None:
             raise ValueError("Duplicate memory id: " + fact.id)
         self._validate_collection(self._group(fact.entity, fact.attribute) + [fact])
+        if fact.supersedes is None:
+            self._check_other_spellings(fact)
         path = self.memory_dir / fact.topic / (fact.id + ".md")
         if not path.parent.resolve().is_relative_to(self.memory_dir.resolve()):
             raise ValueError("Memory topic must not escape the memory folder through a symbolic link")
@@ -857,6 +1059,9 @@ class MemoryStore:
             confidence: float = 1.0, tags: Optional[Sequence[str]] = None,
             links: Optional[Sequence[str]] = None, topic: str = "general",
             recorded_at: TimeInput = None) -> Fact:
+        """Record a new assertion. Names already stored in another letter case or Unicode
+        form (see name_key) take a stored spelling, so the record joins that history; the
+        returned record shows the names it was filed under."""
         with self._transaction():
             self._refresh_locked()
             fact = Fact(id=uuid.uuid4().hex, entity=entity, attribute=attribute, value=value,
@@ -867,6 +1072,13 @@ class MemoryStore:
                         tags=() if tags is None else tags,  # type: ignore[arg-type]
                         links=() if links is None else links,  # type: ignore[arg-type]
                         topic=topic)
+            # Looked up under the write lock, after the refresh, so two writers
+            # cannot both find no stored spelling and file two.
+            stored_entity, stored_attribute = self._stored_names(fact.entity, fact.attribute)
+            names = (fact.entity if stored_entity is None else stored_entity,
+                     fact.attribute if stored_attribute is None else stored_attribute)
+            if names != (fact.entity, fact.attribute):
+                fact = replace(fact, entity=names[0], attribute=names[1])
             return self._write(fact)
 
     def _revision(self, fact_id: str, value: Optional[str], source: str, evidence: str,
@@ -949,11 +1161,14 @@ class MemoryStore:
     def audit_trail(self, entity: str, attribute: str) -> List[Fact]:
         """Every record for one entity/attribute, including superseded revisions,
         in the order they were recorded. A correction always follows the record
-        it supersedes, even when both carry the same timestamp."""
+        it supersedes, even when both carry the same timestamp. Names compare by
+        name_key, so records under every spelling of them are listed."""
         with self._lock:
+            entities, attributes = self._spellings(entity, attribute)
             rows = self.connection.execute(
-                "SELECT id, payload FROM facts WHERE entity = ? AND attribute = ? "
-                "ORDER BY recorded_at, id", (entity, attribute)).fetchall()
+                "SELECT id, payload FROM facts WHERE entity IN ({}) AND attribute IN ({}) "
+                "ORDER BY recorded_at, id".format(_marks(entities), _marks(attributes)),
+                entities + attributes).fetchall()
             facts = [self._fact(row) for row in rows]
         placed: set = set()
         ordered: List[Fact] = []
@@ -974,13 +1189,15 @@ class MemoryStore:
     def _visible(self, known: str, entity: Optional[str] = None,
                  attribute: Optional[str] = None) -> List[Fact]:
         clauses, parameters = ["recorded_at <= ?"], [known]
-        if entity is not None:
-            clauses.append("entity = ?")
-            parameters.append(entity)
-        if attribute is not None:
-            clauses.append("attribute = ?")
-            parameters.append(attribute)
         with self._lock:
+            # Every stored spelling of the names (see name_key).
+            entities, attributes = self._spellings(entity, attribute)
+            if entity is not None:
+                clauses.append("entity IN ({})".format(_marks(entities)))
+                parameters.extend(entities)
+            if attribute is not None:
+                clauses.append("attribute IN ({})".format(_marks(attributes)))
+                parameters.extend(attributes)
             rows = self.connection.execute(
                 "SELECT id, payload FROM facts WHERE " + " AND ".join(clauses)
                 + " ORDER BY entity, attribute, valid_from, recorded_at, id", parameters).fetchall()
@@ -992,17 +1209,45 @@ class MemoryStore:
         # Revisions keep entity, attribute and valid_from, so a filtered query
         # still sees every revision that could supersede a visible record.
         superseded = {fact.supersedes for fact in visible if fact.supersedes is not None}
+        # One timeline per name_key pair, so records under other spellings of the names
+        # (hand edits, releases before 0.3.1) join it. Rows arrive grouped by exact
+        # names in sorted order, which is also the order of the timelines.
         groups: Dict[Tuple[str, str], List[Fact]] = {}
+        joined = set()
+        names: Optional[Tuple[str, str]] = None
+        timeline: List[Fact] = []
         for fact in visible:
-            if fact.id not in superseded:
-                groups.setdefault((fact.entity, fact.attribute), []).append(fact)
+            if fact.id in superseded:
+                continue
+            if (fact.entity, fact.attribute) != names:
+                names = (fact.entity, fact.attribute)
+                key = (name_key(fact.entity), name_key(fact.attribute))
+                if key in groups:
+                    joined.add(key)
+                timeline = groups.setdefault(key, [])
+            timeline.append(fact)
         result: List[Fact] = []
-        for key in sorted(groups):
-            timeline = groups[key]  # Already ordered by valid_from, recorded_at, id.
+        by_id = {fact.id: fact for fact in visible} if joined else {}
+
+        def origin(fact: Fact) -> Tuple[str, str]:
+            # When and as what the record's chain of revisions began. Ranking shared
+            # starts by it means correcting or retracting either record never changes
+            # which one is shown. Every earlier revision is visible: none is recorded
+            # after the revision that supersedes it.
+            while fact.supersedes is not None and fact.supersedes in by_id:
+                fact = by_id[fact.supersedes]
+            return fact.recorded_at, fact.id
+
+        for key, timeline in groups.items():
+            if key in joined:
+                timeline.sort(key=lambda fact: (fact.valid_from,) + origin(fact))
             for index, fact in enumerate(timeline):
                 end = fact.valid_to
                 if index + 1 < len(timeline):
                     following = timeline[index + 1].valid_from
+                    if following == fact.valid_from:
+                        # Only spellings can share a start: the chain begun later wins.
+                        continue
                     end = min(end, following) if end is not None else following
                 result.append(_bounded(fact, end))
         return result
@@ -1011,9 +1256,12 @@ class MemoryStore:
                  entity: Optional[str] = None) -> List[Fact]:
         """Return what held at ``as_of``, using only knowledge recorded by ``known_at``.
 
-        Both default to now. Corrections learned later change retrospective
+        Both default to now; a date alone means 00:00 UTC at the start of that
+        day, not the whole day. Corrections learned later change retrospective
         truth, while a historical ``known_at`` reproduces earlier knowledge.
-        ``entity`` optionally restricts the snapshot to one exact entity name.
+        ``entity`` optionally restricts the snapshot to one entity. Names compare
+        by name_key here and everywhere else: letter case, Unicode compatibility
+        forms and surrounding or repeated spaces do not count.
         """
         effective = normalize_time(as_of)
         return [fact for fact in self._timeline(known_at, entity)
@@ -1025,7 +1273,12 @@ class MemoryStore:
         """Return the effective timeline, including retracted intervals.
 
         Superseded revisions remain available through ``get``/``all_facts``;
-        history shows the timeline as it was known at the requested cutoff.
+        history shows the timeline as it was known at the requested cutoff
+        (default now; a date alone means 00:00 UTC at the start of that day).
+        Records under other spellings of the names (see name_key) share one
+        timeline; of two that start together, the one whose original record
+        (before any correction or retraction) was recorded later is shown, so
+        correcting or retracting either never changes which one that is.
         """
         return sorted(self._timeline(known_at, entity, attribute),
                       key=lambda fact: (fact.valid_from, fact.attribute, fact.recorded_at, fact.id))

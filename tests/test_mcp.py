@@ -144,7 +144,7 @@ def test_index_damage_found_by_a_query_is_reported_with_the_repair_hint(tmp_path
                 assert result.isError, name
                 [content] = result.content
                 assert "The index .memoryos/index.sqlite3 is damaged (" in content.text
-                assert "run `memoryos reindex`" in content.text
+                assert "`memoryos --root <memory directory> reindex`" in content.text
                 assert str(tmp_path) not in content.text
 
     asyncio.run(scenario())

@@ -129,7 +129,7 @@ def test_damaged_index_is_reported_by_every_command_and_repaired_by_reindex(tmp_
         assert (code, output) == (1, None), command
         message = error_of(error)
         assert message.startswith("The index .memoryos/index.sqlite3 is damaged (")
-        assert "run `memoryos reindex`" in message and root not in message
+        assert "`memoryos --root <memory directory> reindex`" in message and root not in message
         assert sorted(p.name for p in (tmp_path / ".memoryos").iterdir()) == ["index.sqlite3"]
     code, result, error = run(capsys, "--root", root, "reindex")
     assert code == 0, error
@@ -167,7 +167,7 @@ def test_index_damage_found_by_a_query_is_reported_with_the_repair_hint(tmp_path
         assert (code, output) == (1, None), command
         message = error_of(error)
         assert message.startswith("The index .memoryos/index.sqlite3 is damaged (")
-        assert "run `memoryos reindex`" in message and root not in message
+        assert "`memoryos --root <memory directory> reindex`" in message and root not in message
 
 
 def replace_in_index(root, old, new):
@@ -195,7 +195,7 @@ def test_index_damage_that_passes_the_page_check_gets_the_hint_and_reindex_repai
         assert (code, output) == (1, None), command
         message = error_of(error)
         assert message.startswith("The index .memoryos/index.sqlite3 is damaged (")
-        assert "run `memoryos reindex`" in message and root not in message
+        assert "`memoryos --root <memory directory> reindex`" in message and root not in message
     for _ in range(2):  # The second run finds nothing left to repair.
         code, result, error = run(capsys, "--root", root, "reindex")
         assert (code, result) == (0, {"indexed": 1}), error
@@ -317,6 +317,7 @@ def test_demo_after_a_conflicting_manual_add_reports_skipped_slots(tmp_path, cap
 def test_extract_file_with_a_byte_order_mark(tmp_path, capsys):
     conversation = tmp_path / "conversation.txt"
     conversation.write_bytes(b"\xef\xbb\xbfuser | city | Paris | 2026-09-01\nMy drink is tea.\n")
+    assert run(capsys, "--root", str(tmp_path / "store"), "init")[0] == 0
     code, proposals, error = run(capsys, "--root", str(tmp_path / "store"), "extract",
                                  "--file", str(conversation), "--source", "synthetic:file",
                                  "--observed-at", "2026-10-01")
@@ -328,6 +329,7 @@ def test_extract_file_with_a_byte_order_mark(tmp_path, capsys):
 def test_extract_file_holding_only_a_byte_order_mark_is_empty(tmp_path, capsys):
     conversation = tmp_path / "conversation.txt"
     conversation.write_bytes(b"\xef\xbb\xbf\n")
+    assert run(capsys, "--root", str(tmp_path / "store"), "init")[0] == 0
     code, output, error = run(capsys, "--root", str(tmp_path / "store"), "extract",
                               "--file", str(conversation), "--source", "synthetic:file")
     assert (code, output) == (1, None)
@@ -339,6 +341,7 @@ def test_extract_file_byte_order_mark_does_not_count_toward_the_size_limit(tmp_p
     line = "user | city | Paris | 2026-09-01\n"
     conversation = tmp_path / "conversation.txt"
     conversation.write_bytes(b"\xef\xbb\xbf" + (line + "\n" * (1_000_000 - len(line))).encode())
+    assert run(capsys, "--root", str(tmp_path / "store"), "init")[0] == 0
     code, proposals, error = run(capsys, "--root", str(tmp_path / "store"), "extract",
                                  "--file", str(conversation), "--source", "synthetic:file")
     assert code == 0, error
@@ -378,6 +381,7 @@ def test_malformed_proposal_file_is_a_warning_when_listing_and_an_error_when_use
 
 def test_cli_errors_do_not_disclose_the_absolute_path(tmp_path, capsys):
     root = tmp_path / "store"
+    assert run(capsys, "--root", str(root), "init")[0] == 0
     _, fact, _ = run(capsys, "--root", str(root), "add", "person", "drink", "tea")
     [path] = (root / "memory").rglob("*.md")
     path.write_bytes(b"")

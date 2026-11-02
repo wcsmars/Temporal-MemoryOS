@@ -326,22 +326,22 @@ def test_names_that_are_prefixes_of_each_other_stay_fast(monkeypatch):
     Four times the names and query cost about 15 times as much (the query's length times
     the longest name); collecting every name at every match cost about 50 times as much.
     The growth is compared rather than the time, so a slow machine cannot fail the test.
+    The two sizes take turns, so a busy moment on a shared machine slows both of them.
     """
     def setup(count):
         facts = [Fact("%032x" % number, " ".join(["the"] * (number + 1)), "genre", "rock",
                       valid_from="2025-01-01") for number in range(count)]
         return HybridRetriever(Facts(facts), HashingEmbedder()), "the " * (6 * count)
 
-    def fastest(retriever, query):
-        times = []
-        for _ in range(3):
+    sizes = {400: setup(400), 100: setup(100)}
+    times = {count: [] for count in sizes}
+    for _ in range(5):
+        for count, (retriever, query) in sizes.items():
             started = time.perf_counter()
             retriever.search(query, mode="keyword", limit=5)
-            times.append(time.perf_counter() - started)
-        return min(times)
-
-    retriever, query = setup(400)
-    assert fastest(retriever, query) < 30 * fastest(*setup(100))
+            times[count].append(time.perf_counter() - started)
+    assert min(times[400]) < 30 * min(times[100])
+    retriever, query = sizes[400]
     found = [hit.fact.id for hit in retriever.search(query, mode="keyword", limit=5)]
     monkeypatch.setattr(retrieval_module, "_named_words", names_written_out)
     assert [hit.fact.id for hit in retriever.search(query, mode="keyword", limit=5)] == found

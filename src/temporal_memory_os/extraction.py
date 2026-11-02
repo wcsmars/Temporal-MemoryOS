@@ -4,6 +4,15 @@ This is a rule-based extractor, not an LLM. Lines it does not understand are
 skipped, including lines with ``|`` that are not a well-formed structured fact
 and lines whose date prefix is not a valid date. For arbitrary assertions,
 use: entity | attribute | value | optional ISO date.
+
+A line in a bulleted or numbered list is read without its list marker, which
+is left out of the evidence too, so "- X" and "X" are the same statement. A
+marker is a bullet (- * + • ◦ ‣ ▪ ● ○ ■ · ・, or an en or em dash) or up to
+three digits and "." or ")", followed by whitespace; only one is removed.
+Letters and bracketed numbers ("a.", "(1)") are not markers, as names and
+numbers start that way too ("J. Smith", "(555) 123-4567"). A to-do item
+("- [ ] call Acme") is skipped: it is a task rather than a fact, and an
+unticked one is not done yet.
 """
 from __future__ import annotations
 
@@ -20,17 +29,29 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 import unicodedata
 from uuid import uuid4
 
-from .models import Fact, _text, normalize_time, validate_topic
-from .store import MemoryConflictError, MemoryStore, StoreIntegrityError, _flush_directory
+from .models import Fact, _text, name_key, normalize_time, validate_topic
+from .store import (_MISSING_DIRECTORY, MemoryConflictError, MemoryStore,
+                    MissingMemoryDirectoryError, StoreIntegrityError, _flush_directory)
 
 _PROPOSAL_ID = re.compile(r"[a-f0-9]{32}")
 _STATUSES = ("pending", "approved", "rejected")
 _KINDS = ("add", "update", "correct", "duplicate")
+# A parsed line: entity, attribute, value, effective time, the line, confidence, dated.
+_Candidate = Tuple[str, str, str, str, str, float, bool]
 # A possible sentence end: the word before it, a terminator, any closing quotes or
 # brackets, then a space. A match starts only at the start of that word, so a long
 # word is scanned once.
 _SENTENCE_END = re.compile(
     r"(?<!\w)(\w*)([.!?])[\"'\u201d\u2019\u00bb\u203a)\]}\u300d\u300f\u3011\uff09\uff3d\uff5d]*\s")
+# A list marker at the start of a line: a bullet (- * + • ◦ ‣ ▪ ● ○ ■, the middle dots
+# · and ・ that lists copied from word processors and Japanese text use, or an en
+# or em dash) or a list number as Markdown writes one, then whitespace. Four digits
+# are more likely a year.
+_LIST_MARKER = re.compile(
+    r"(?:[-*+\u2022\u25e6\u2023\u25aa\u25cf\u25cb\u25a0\u00b7\u30fb\N{EN DASH}\N{EM DASH}]"
+    r"|[0-9]{1,3}[.)])\s+")
+# A to-do box after the marker, or at the start of a line: "- [ ] call Acme", "[x] call Acme".
+_TASK_BOX = re.compile(r"\[[ xX]\]\s")
 
 
 def _now() -> str:
@@ -82,23 +103,42 @@ def _well_typed(proposal: "Proposal") -> bool:
     return True
 
 
+def _names(entity: str, attribute: str) -> Tuple[str, str]:
+    """Entity and attribute as the store compares them (see name_key)."""
+    return name_key(entity), name_key(attribute)
+
+
 def _line(proposal: "Proposal") -> Tuple[str, ...]:
-    """The line a proposal was extracted from, and where it was extracted to."""
-    return (proposal.entity, proposal.attribute, proposal.value, proposal.source,
+    """The line a proposal was extracted from, and where it was extracted to. Names
+    compare as in the store, so a proposal that kept another spelling of them (as
+    releases before 0.3.1 did) still matches its line."""
+    return (*_names(proposal.entity, proposal.attribute), proposal.value, proposal.source,
             proposal.evidence, proposal.topic)
 
 
 def _statement(proposal: "Proposal") -> Tuple[Any, ...]:
     """What approving ``proposal`` asserts. A correction keeps its target's
     topic folder, so the target stands in for the topic."""
-    return (proposal.entity, proposal.attribute, proposal.value, proposal.valid_from,
+    return (*_names(proposal.entity, proposal.attribute), proposal.value, proposal.valid_from,
             proposal.source, proposal.evidence, proposal.confidence,
             proposal.target_id if proposal.kind == "correct" else proposal.topic)
 
 
+def _spelling(used: List[str], given: str) -> str:
+    """``given`` if it is one of the spellings already ``used`` for a name, else the
+    first of them; a name not used yet keeps ``given``, which later lines then use."""
+    if not used:
+        used.append(given)
+    return given if given in used else used[0]
+
+
 def _content(line: str) -> str:
     # Files joined with cat keep each one's byte-order mark, at a line start.
-    return line.strip().lstrip("\ufeff").strip()
+    content = line.strip().lstrip("\ufeff").strip()
+    # A list marker only formats the line. Only one is removed, so a name that starts
+    # like one can still follow one ("- 1. FC Köln | league | Bundesliga").
+    marker = _LIST_MARKER.match(content)
+    return content[marker.end():] if marker else content
 
 
 def _more_than_one_sentence(statement: str) -> bool:
@@ -164,7 +204,17 @@ class ProposalQueue:
         self.directory = Path(store.root) / "proposals"
         if self.directory.is_symlink():
             raise StoreIntegrityError("Proposal directory must not be a symbolic link")
-        self.directory.mkdir(parents=True, exist_ok=True)
+        try:
+            # Without parents: a memory directory moved away since the store opened
+            # is reported, not replaced by a new one holding only this folder.
+            self.directory.mkdir(exist_ok=True)
+        except FileNotFoundError:
+            raise MissingMemoryDirectoryError(_MISSING_DIRECTORY) from None
+        except FileExistsError:
+            raise StoreIntegrityError("proposals/ in the memory directory is not a folder") from None
+        except OSError as error:  # Such as a read-only memory directory; the message names no path.
+            raise OSError(error.errno, "Cannot open the memory directory: {}".format(
+                error.strerror)) from None
         self.problems: List[str] = []  # Damaged files skipped by the last list().
 
     @contextmanager
@@ -267,8 +317,9 @@ class ProposalQueue:
                       key=lambda p: (normalize_time(p.created_at), p.id))
 
     def _classify(self, entity: str, attribute: str, value: str, valid_from: str) -> Dict[str, Any]:
+        wanted = name_key(attribute)
         facts = [f for f in self.store.snapshot(as_of=valid_from, entity=entity)
-                 if f.attribute == attribute]
+                 if name_key(f.attribute) == wanted]
         restoring = False
         if not facts:
             # A tombstone still owns its effective timestamp. Restoring it is
@@ -372,10 +423,12 @@ class ProposalQueue:
         if isinstance(observed_at, str) and not observed_at.strip():
             observed_at = None  # An empty time means "now", as when it is omitted.
         observed = normalize_time(_now() if observed_at is None else observed_at)
-        candidates = []
+        candidates: List[_Candidate] = []
         for line in text.splitlines():
             raw = _content(line)
-            if not raw or raw.startswith("#"):
+            # A comment, or a to-do item: a task rather than a fact, and an unticked
+            # one is not done yet.
+            if not raw or raw.startswith("#") or _TASK_BOX.match(raw):
                 continue
             parsed = self._parse_line(raw, observed)
             if parsed is None:
@@ -393,19 +446,23 @@ class ProposalQueue:
             candidates.append((entity, attribute, value, effective, raw, confidence, dated))
         with self._lock():
             self.store.refresh()
+            queued = self.list(status="all")
+            candidates = self._respelled(candidates, queued)
             # Indexed, so a long text is not compared with the whole queue line by line.
+            # Names are keyed as the store compares them (see name_key).
             statements: Dict[Tuple[str, ...], List[Proposal]] = {}
             histories: Dict[Tuple[str, str], List[Proposal]] = {}
 
             def remember(proposal: Proposal) -> None:
                 statements.setdefault(_line(proposal), []).append(proposal)
-                histories.setdefault((proposal.entity, proposal.attribute), []).append(proposal)
+                histories.setdefault(_names(proposal.entity, proposal.attribute),
+                                     []).append(proposal)
 
-            for proposal in self.list(status="all"):
+            for proposal in queued:
                 remember(proposal)
             # Where this text last states each line, so a re-extracted log keeps its order.
             last: Dict[Tuple[str, ...], int] = {
-                (entity, attribute, value, source, raw, topic): index
+                (*_names(entity, attribute), value, source, raw, topic): index
                 for index, (entity, attribute, value, _, raw, *_) in enumerate(candidates)}
             # A line followed in this text by another value for its attribute was said
             # before that value; only a line no other value follows can be a new
@@ -413,7 +470,7 @@ class ProposalQueue:
             followed: List[bool] = []
             values_after: Dict[Tuple[str, str], set[str]] = {}
             for entity, attribute, value, *_ in reversed(candidates):
-                values = values_after.setdefault((entity, attribute), set())
+                values = values_after.setdefault(_names(entity, attribute), set())
                 followed.append(len(values) > (value in values))  # Another value follows.
                 values.add(value)
             followed.reverse()
@@ -428,22 +485,22 @@ class ProposalQueue:
             created = ""
             for index, (entity, attribute, value, effective, raw, confidence,
                         dated) in enumerate(candidates):
-                same = statements.get((entity, attribute, value, source, raw, topic), [])
+                names = _names(entity, attribute)
+                same = statements.get((*names, value, source, raw, topic), [])
                 duplicate = next((p for p in same if p.status != "rejected"
                                   and (p.valid_from == effective
                                        or self._same_undated(
-                                           p, dated, observed_at, observed,
-                                           histories[(entity, attribute)],
+                                           p, dated, observed_at, observed, histories[names],
                                            lambda other: (followed[index]
                                                           or last.get(_line(other), -1) > index)))),
                                  None)
                 if duplicate:
-                    instants.setdefault((entity, attribute, duplicate.valid_from), set()).add(raw)
+                    instants.setdefault((*names, duplicate.valid_from), set()).add(raw)
                     if duplicate.id not in returned:  # A repeated line is returned once.
                         returned.add(duplicate.id)
                         results.append(duplicate)
                     continue
-                instants.setdefault((entity, attribute, effective), set()).add(raw)
+                instants.setdefault((*names, effective), set()).add(raw)
                 proposal = Proposal(id=uuid4().hex, entity=entity, attribute=attribute, value=value,
                                     valid_from=effective, source=source, evidence=raw, topic=topic,
                                     created_at=(created := _after(created)),
@@ -455,12 +512,38 @@ class ProposalQueue:
                 returned.add(proposal.id)
                 results.append(proposal)
             for proposal in new:
-                if len(instants[(proposal.entity, proposal.attribute, proposal.valid_from)]) > 1:
+                instant = (*_names(proposal.entity, proposal.attribute), proposal.valid_from)
+                if len(instants[instant]) > 1:
                     proposal.warnings.append(
                         "Another line in this text gives {} for the same time; only one can be "
                         "approved.".format(proposal.attribute))
                 self._save(proposal)
             return results
+
+    def _respelled(self, candidates: List[_Candidate], queued: List[Proposal]
+                   ) -> List[_Candidate]:
+        """Candidates whose names take the spelling memory already uses for them (see
+        name_key): stored records first, then proposals in the queue, then earlier
+        lines of this text. Proposals then show, and approve into, one history."""
+        entities: Dict[str, List[str]] = {}
+        attributes: Dict[Tuple[str, str], List[str]] = {}
+        for proposal in queued:  # In creation order.
+            if proposal.status != "rejected":
+                names = _names(proposal.entity, proposal.attribute)
+                entities.setdefault(names[0], []).append(proposal.entity)
+                attributes.setdefault(names, []).append(proposal.attribute)
+        stored: Dict[Tuple[str, str], Tuple[Optional[str], Optional[str]]] = {}
+        respelled: List[_Candidate] = []
+        for entity, attribute, value, effective, raw, confidence, dated in candidates:
+            names = _names(entity, attribute)
+            if names not in stored:
+                stored[names] = self.store._stored_names(entity, attribute)
+            stored_entity, stored_attribute = stored[names]
+            respelled.append((
+                stored_entity or _spelling(entities.setdefault(names[0], []), entity),
+                stored_attribute or _spelling(attributes.setdefault(names, []), attribute),
+                value, effective, raw, confidence, dated))
+        return respelled
 
     def _same_undated(self, pending: Proposal, dated: bool, observed_at: Optional[str],
                       now: str, queued: List[Proposal],
@@ -614,6 +697,23 @@ class ProposalQueue:
                         and predecessor.valid_from <= proposal.valid_from
                         and self._reviewed_unchanged(proposal, predecessor)):
                     return str(kind)
+            # Releases before 0.3.1 compared names exactly, so a proposal they queued
+            # can have missed a record stored under other capitals or spacing. A record
+            # restored from a backup, or added with an earlier recorded_at, looks the same.
+            # Checked before the same-source rule, so the refusal names the record.
+            if target is not None and target != proposal.target_id:
+                seen = self.store.get(str(target))
+                reviewed = (None if proposal.target_id is None
+                            else self.store.get(proposal.target_id))
+                if (seen.recorded_at < normalize_time(proposal.created_at)
+                        and (seen.entity, seen.attribute) != (proposal.entity, proposal.attribute)
+                        and (reviewed is None
+                             or _fingerprint(reviewed) == proposal.target_fingerprint)):
+                    raise MemoryConflictError(
+                        "Memory holds {} / {}, recorded before this proposal was made but not "
+                        "shown in its preview (a release before 0.3.1, which compared names "
+                        "exactly, including letter case, may have made the proposal); reject it "
+                        "and extract again".format(seen.entity, seen.attribute))
             if (proposal.kind == "add" and current.get("kind") in ("correct", "duplicate")
                     and target is not None
                     and self.store.get(str(target)).source == proposal.source):
@@ -630,9 +730,10 @@ class ProposalQueue:
         """The record the reviewer saw is unedited, still in effect at its own
         time, and older than the newer predecessor."""
         reviewed = self.store.get(str(proposal.target_id))
+        wanted = name_key(proposal.attribute)
         in_effect = [fact.id for fact in self.store.snapshot(as_of=reviewed.valid_from,
                                                              entity=proposal.entity)
-                     if fact.attribute == proposal.attribute]
+                     if name_key(fact.attribute) == wanted]
         return (predecessor.valid_from > reviewed.valid_from and in_effect == [reviewed.id]
                 and _fingerprint(reviewed) == proposal.target_fingerprint)
 

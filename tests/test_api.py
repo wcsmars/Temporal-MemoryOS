@@ -451,7 +451,8 @@ def test_damaged_index_returns_503_and_only_the_cli_repairs_it(tmp_path, client)
                      client.post("/api/reindex")):
         assert response.status_code == 503, response.text
         detail = response.json()["detail"]
-        assert "run `memoryos reindex`" in detail and str(tmp_path) not in detail
+        assert "`memoryos --root <memory directory> reindex`" in detail
+        assert str(tmp_path) not in detail
     # The server never renames files that other requests may have open.
     assert sorted(p.name for p in (tmp_path / ".memoryos").iterdir()) == ["index.sqlite3"]
 
@@ -486,7 +487,8 @@ def test_index_damage_found_by_a_query_returns_503_with_the_repair_hint(tmp_path
         assert response.status_code == 503, response.text
         detail = response.json()["detail"]
         assert detail.startswith("The index .memoryos/index.sqlite3 is damaged (")
-        assert "run `memoryos reindex`" in detail and str(tmp_path) not in detail
+        assert "`memoryos --root <memory directory> reindex`" in detail
+        assert str(tmp_path) not in detail
     assert sorted(p.name for p in (tmp_path / ".memoryos").iterdir()) == ["index.sqlite3"]
     from temporal_memory_os.store import MemoryStore
 
@@ -529,7 +531,8 @@ def test_index_damage_that_passes_the_page_check_returns_503_not_422_or_500(tmp_
         assert response.status_code == 503, response.text
         detail = response.json()["detail"]
         assert detail.startswith("The index .memoryos/index.sqlite3 is damaged (")
-        assert "run `memoryos reindex`" in detail and str(tmp_path) not in detail
+        assert "`memoryos --root <memory directory> reindex`" in detail
+        assert str(tmp_path) not in detail
     response = client.post("/api/reindex")
     assert response.status_code == (200 if rebuilt else 503), response.text
     assert sorted(p.name for p in (tmp_path / ".memoryos").iterdir()) == ["index.sqlite3"]
@@ -610,6 +613,7 @@ def test_one_embedder_and_vector_cache_serve_every_request(tmp_path, monkeypatch
 def test_empty_memoryos_home_uses_the_default_folder(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEMORYOS_HOME", "")
+    (tmp_path / "memory-data").mkdir()  # The API never creates the memory directory.
     with TestClient(create_app(), base_url="http://localhost") as test_client:
         add(test_client)
     assert len(list((tmp_path / "memory-data" / "memory").rglob("*.md"))) == 1

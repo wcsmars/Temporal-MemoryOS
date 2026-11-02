@@ -27,7 +27,7 @@ memoryos --root ./memory-data search "Acme application status" \
 
 The result contains `value: "pending"`, its effective interval, source, evidence, fact ID, retrieval scores, and the Markdown citation. Run the same search with `--as-of 2026-09-20` for `interview invited`, or `--as-of 2026-10-02` for `interview completed`.
 
-`--root` goes **before** the command. Set `MEMORYOS_HOME` to use a different default directory. The demo is safe to run repeatedly: it never overwrites or corrects existing records, and reports any slot that already holds something else under `skipped_existing`.
+`--root` goes **before** the command. Set `MEMORYOS_HOME` to use a different default directory. Among CLI commands, only `init`, `demo` and `git-init` create a missing memory directory (readable only by you); every other command, the HTTP API and the MCP server report it as missing, so a folder that was moved or renamed is reported instead of being replaced by an empty one. The demo is safe to run repeatedly: it never overwrites or corrects existing records, and reports any slot that already holds something else under `skipped_existing`.
 
 To run directly from a checkout without installing:
 
@@ -101,6 +101,7 @@ These commands use a fresh directory so they do not collide with the demo's synt
 
 ```sh
 export MEMORYOS_HOME=./memory-data/personal
+memoryos init
 memoryos add "Acme application" status pending \
   --from 2026-09-01 --source "conversation:001" \
   --evidence "The application was submitted and is awaiting review." \
@@ -117,6 +118,8 @@ memoryos retract NEW_ID --source "conversation:retraction"
 
 Replace `FACT_ID` with an ID returned by a command, and `NEW_ID` with the ID that `correct` returned: only the latest revision of a record can be corrected or retracted. `correct` keeps the original effective date and creates a new revision. Use `add` with a later `--from` when the world changes. A retraction removes that assertion from resolved snapshots; it is **not deletion of the audit record**.
 
+Entity and attribute names ignore letter case, Unicode compatibility forms (such as full-width letters) and extra spaces: `User`, `USER` and `user` with spaces around it are one entity, and `Favourite drink` and `favourite DRINK` one attribute. Accents still count. Each record keeps the spelling it was written with, and `add` (also `MemoryStore.add()` and `POST /api/facts`) files a new record under the spelling memory already uses for the same names, so it continues that history, and returns it in that spelling; the CLI also says so on standard error when it changes the names you typed. Case folding follows Unicode, so `Straße` matches `STRASSE`, and a few recently added characters fold differently on older Python versions.
+
 For knowledge history, pass a separate cutoff. The demo's records carry the dates they were learned, so this works on the demo directory:
 
 ```sh
@@ -126,7 +129,7 @@ memoryos --root ./memory-data search "Alex preferred drink" \
   --as-of 2026-10-10 --limit 1                          # decaf coffee
 ```
 
-The demo learned on 5 October that Alex's drink had changed, so a query limited to what was known on 1 October still answers tea. Corrections work the same way: one learned in October changes the retrospective answer for September, but cannot appear in a query restricted to knowledge available in September. Records entered with `add` are learned now, so a `--known-at` earlier than today excludes them; an importer can supply `recorded_at` through the Python API. Both query times default to now. Times are `YYYY-MM-DD`, optionally followed by `THH:MM`, seconds, up to six fractional digits, and `Z` or `+HH:MM`; the same strings are accepted on every supported Python version. A date without a time means midnight UTC; offsets are normalized to UTC. Date arguments are explicit: the engine does not infer dates from the question text.
+The demo learned on 5 October that Alex's drink had changed, so a query limited to what was known on 1 October still answers tea. Corrections work the same way: one learned in October changes the retrospective answer for September, but cannot appear in a query restricted to knowledge available in September. Records entered with `add` are learned now, so a `--known-at` earlier than today excludes them; an importer can supply `recorded_at` through the Python API. Both query times default to now. Times are `YYYY-MM-DD`, optionally followed by `THH:MM`, seconds, up to six fractional digits, and `Z` or `+HH:MM`; the same strings are accepted on every supported Python version. Offsets are normalized to UTC, and a time without `Z` or an offset is read as UTC too. A date alone means 00:00 UTC at the start of that day, not the whole day and not local time: at UTC+8, `--known-at 2026-11-01` stops at 08:00 local time and leaves out anything recorded later that day. To cover a whole local day, give a time with an offset, such as `2026-11-01T23:59:59.999999+08:00`, or leave the option out to mean now. Date arguments are explicit: the engine does not infer dates from the question text.
 
 ## Extract with human review
 
@@ -151,7 +154,7 @@ My preferred language is English.
 I prefer decaf coffee.
 ```
 
-The fourth pipe-separated field is an optional effective date. An optional date prefix also works. Otherwise the observation time is used. Unsupported lines are skipped, including prose or tables that contain `|` without forming three or four fields, and lines with an invalid date; zero proposals means no supported statements were found. Text or a source that is not valid Unicode is rejected. A line with both a date prefix and a different fourth-field date is skipped as ambiguous, and so is a dated line that is a `#` comment. Sentence rules read one sentence per line: a line with more than one sentence is skipped, also when the first sentence ends inside a closing quote or bracket ('"Carpe diem." I live by it'). A period after a capital initial in any script or a two-letter abbreviation ("J.", "É.", "Dr.", "St.") does not end a sentence; other abbreviations followed by a space ("Mrs.", "Inc.", "e.g.") do, so write such lines in the pipe form, which accepts any value. The sentence rules are deliberately narrow and can still misread unusual prose, which is why every proposal is reviewed. Rule confidence values describe parser certainty, not calibrated truth probabilities. Each `(entity, attribute)` has one value at a time, so two lines giving the same attribute for the same time are flagged and only one can be approved; use distinct attributes for multiple concurrent preferences.
+The fourth pipe-separated field is an optional effective date. An optional date prefix also works. Otherwise the observation time is used. A line may sit in a bulleted or numbered list: one marker at its start (`-`, `*`, `+`, `•` and similar bullets, an en or em dash, or up to three digits followed by `.` or `)`, then whitespace) is ignored and left out of the evidence, so `- X` and `X` are the same statement. Letters and bracketed numbers (`a.`, `(1)`) are not markers, because names start that way too; to keep a name such as `1. FC Köln`, put a bullet before it. To-do items (`- [ ] call Acme`, `[x] ...`) are skipped like comments. Releases before 0.3.1 kept the marker as part of the name (`- user`): reject pending proposals with such names, and retract records filed under them and add them again. Unsupported lines are skipped, including prose or tables that contain `|` without forming three or four fields, and lines with an invalid date; zero proposals means no supported statements were found. Text or a source that is not valid Unicode is rejected. A line with both a date prefix and a different fourth-field date is skipped as ambiguous, and so is a dated line that is a `#` comment. Sentence rules read one sentence per line: a line with more than one sentence is skipped, also when the first sentence ends inside a closing quote or bracket ('"Carpe diem." I live by it'). A period after a capital initial in any script or a two-letter abbreviation ("J.", "É.", "Dr.", "St.") does not end a sentence; other abbreviations followed by a space ("Mrs.", "Inc.", "e.g.") do, so write such lines in the pipe form, which accepts any value. The sentence rules are deliberately narrow and can still misread unusual prose, which is why every proposal is reviewed. Rule confidence values describe parser certainty, not calibrated truth probabilities. Each `(entity, attribute)` has one value at a time, so two lines giving the same attribute for the same time are flagged and only one can be approved; use distinct attributes for multiple concurrent preferences. Names compare as in the store, so a proposal takes the spelling memory already uses for its names (that of stored records, then of queued proposals, then of earlier lines in the same text). Extracting a line again returns its pending proposal, also in another list style or after memory has come to use another spelling of its names. The evidence keeps the line's own capitals, so a line retyped in other capitals gets a proposal of its own, and only one of the two can be approved.
 
 ## Editable storage
 
@@ -169,10 +172,10 @@ Every fact includes `entity`, `attribute`, `value`, `valid_from`, optional `vali
 Edits made with an editor are picked up automatically. The index records each Markdown file's size, modification time and SHA-256. Opening the store and every write compare sizes and modification times with the folder, and also hash any file modified within a few seconds of its last check (a timestamp that close cannot be trusted on every filesystem). The index is rebuilt only if something changed outside the engine. A copy that keeps the old size and timestamp (`cp -p`, `rsync -t`, `touch -r`) can go unnoticed; after such a change, rebuild explicitly:
 
 ```sh
-memoryos reindex
+memoryos --root ./memory-data reindex
 ```
 
-A complete validation pass precedes index replacement; a malformed record cannot replace a good index with a partial one, and the error names the files involved, relative to the memory directory. Long-lived Python instances call `refresh()` (cheap when nothing changed) to see external edits made while they are open. SQLite is disposable: if the index file is damaged, commands stop with a message, and `memoryos reindex` sets a damaged file aside as `index.sqlite3.corrupt-<time>` and rebuilds it from the Markdown (damage confined to stored record text is simply rebuilt in place) (stop servers using the directory first). An index written by a newer release asks you to delete `.memoryos/`; to go back to an older release, delete `.memoryos/` too, since older releases cannot read the newer index; settle pending proposals first, because older releases also refuse proposal files written by a newer one. Changing an old file directly rewrites that source history; use `correct` when the previous assertion must remain auditable.
+A complete validation pass precedes index replacement; a malformed record cannot replace a good index with a partial one, and the error names the files involved, relative to the memory directory. A JSON syntax error also gives its line and column in the file, as an editor counts them, whatever the file's line endings. Long-lived Python instances call `refresh()` (cheap when nothing changed) to see external edits made while they are open. SQLite is disposable: if the index file is damaged, commands stop with a message, and reindex with the same `--root` (or `MEMORYOS_HOME`) that the store was opened with, as in `memoryos --root <memory directory> reindex`, sets a damaged file aside as `index.sqlite3.corrupt-<time>` and rebuilds it from the Markdown (damage confined to stored record text is simply rebuilt in place); stop servers using the directory first. Without `--root`, reindex rebuilds the default directory (`MEMORYOS_HOME`, or else `./memory-data`), which may be a different memory; if that directory does not exist, reindex reports it as missing and changes nothing. An index written by a newer release asks you to delete `.memoryos/`; to go back to an older release, delete `.memoryos/` too, since older releases cannot read the newer index; settle pending proposals first, because older releases also refuse proposal files written by a newer one. Changing an old file directly rewrites that source history; use `correct` when the previous assertion must remain auditable.
 
 ## Python API and learned embeddings
 
@@ -187,6 +190,8 @@ with MemoryStore("./memory-data") as store:
     for match in matches:
         print(match.fact.value, match.fact.source, match.citation)
 ```
+
+`MemoryStore(root)` creates a missing memory directory, as `init` does (`store.created` says whether it did). Pass `create=False` to raise `MissingMemoryDirectoryError` (from `temporal_memory_os.store`) instead; the HTTP API, the MCP server and every CLI command other than `init`, `demo` and `git-init` report a missing directory with this error.
 
 To enable a learned embedding model for the CLI, API, and MCP:
 
@@ -261,7 +266,7 @@ export MEMORYOS_API_TOKEN='choose-a-local-token'
 memoryos --root ./memory-data serve
 ```
 
-The default listener is `127.0.0.1:8000`. Interactive documentation: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs). `/health` is public; every `/api` route uses bearer authentication when the token is set (ASCII only), and the token is checked before a request body is read, also behind `uvicorn --root-path` or when the app is mounted under a path prefix. Requests must be addressed to `localhost`, `127.0.0.1` or `::1`, which stops web pages from reaching the API through DNS rebinding, and requests that would change memory are refused when a browser marks them as coming from another site. When serving on another interface, add the host names clients use to `MEMORYOS_ALLOWED_HOSTS` (comma-separated; localhost stays allowed) and set a token: these checks protect against browsers, not against other clients on the network. This is a single-user local service, not a multi-tenant deployment.
+The default listener is `127.0.0.1:8000`. Interactive documentation: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs). `/health` is public; every `/api` route uses bearer authentication when the token is set (ASCII only), and the token is checked before a request body is read, also behind `uvicorn --root-path` or when the app is mounted under a path prefix. Requests must be addressed to `localhost`, `127.0.0.1` or `::1`, which stops web pages from reaching the API through DNS rebinding, and requests that would change memory are refused when a browser marks them as coming from another site. When serving on another interface, add the host names clients use to `MEMORYOS_ALLOWED_HOSTS` (comma-separated; localhost stays allowed) and set a token: these checks protect against browsers, not against other clients on the network. This is a single-user local service, not a multi-tenant deployment. Restart a running `serve` after upgrading Temporal MemoryOS, since it keeps the old code.
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
@@ -275,7 +280,7 @@ The default listener is `127.0.0.1:8000`. Interactive documentation: [http://127
 | POST | `/api/proposals/{id}/approve` or `/reject` | Resolve a proposal |
 | POST | `/api/reindex` | Rebuild the derived index |
 
-The API rejects client-supplied `recorded_at`; imports that need it use the Python interface. Invalid data produces 422, missing records 404, conflicting writes and stale approvals 409, and 503 means the server's files need attention: a damaged record or index, an unreadable proposal file, or a symbolic link where a folder or proposal file should be (the message names the file relative to the memory directory), or an embedding model that cannot load or returns unusable vectors (details go to the server log only). A proposal file with damaged contents is listed under `problems`, and approving or rejecting it returns 422 naming the file. Each tag and link is limited to 500 characters and each time string, in a request body or in the `as_of` and `known_at` query parameters, to 64.
+The API rejects client-supplied `recorded_at`; imports that need it use the Python interface. Invalid data produces 422, missing records 404, conflicting writes and stale approvals 409, and 503 means the server's files need attention: a missing memory directory (the API never creates one: move the folder back, or run `memoryos init` with the same `--root` or `MEMORYOS_HOME` to start a new, empty memory) or a file in its place or in place of one of its folders, a damaged record or index, an unreadable proposal file, or a symbolic link where a folder or proposal file should be (the message names the file relative to the memory directory), or an embedding model that cannot load or returns unusable vectors (details go to the server log only). A proposal file with damaged contents is listed under `problems`, and approving or rejecting it returns 422 naming the file. Each tag and link is limited to 500 characters and each time string, in a request body or in the `as_of` and `known_at` query parameters, to 64.
 
 ## MCP integration
 
@@ -284,7 +289,7 @@ python -m pip install -e '.[mcp]'
 memoryos --root ./memory-data mcp
 ```
 
-Use this configuration in a compatible client that supports local stdio MCP servers, replacing both absolute paths:
+Use this configuration in a compatible client that supports local stdio MCP servers, replacing both absolute paths. The server never creates the memory directory, so create it first (`memoryos --root /absolute/path/to/private-memory init`).
 
 ```json
 {
@@ -297,7 +302,7 @@ Use this configuration in a compatible client that supports local stdio MCP serv
 }
 ```
 
-Tools are `search`, `fetch`, and `memory_history`. They are read-only; changes happen through the operator CLI or API approval workflow. `fetch` retrieves an audit record and may return a superseded assertion, so use dated `search` to determine current truth. Treat retrieved memory as data, not instructions. This integration does not replace any client's built-in memory, and local stdio configuration is client-specific. The server uses the [official MCP Python SDK v1](https://py.sdk.modelcontextprotocol.io/v1/).
+Tools are `search`, `fetch`, and `memory_history`. They are read-only; changes happen through the operator CLI or API approval workflow. Entity and attribute names match as in the CLI: letter case, Unicode compatibility forms and extra spaces do not count. The server's instructions and the descriptions of its date parameters tell the assistant that a date alone means 00:00 UTC at the start of that day; `search` also returns `as_of_utc` and `known_at_utc`, the UTC instants it used (now, for a cutoff left out), and `memory_history` returns `known_at` and `known_at_utc` the same way. If the memory directory is moved, renamed or deleted, every tool call says so until it is back; restart the client after upgrading Temporal MemoryOS, since a running server keeps the old code. `fetch` retrieves an audit record and may return a superseded assertion, so use dated `search` to determine current truth. Treat retrieved memory as data, not instructions. This integration does not replace any client's built-in memory, and local stdio configuration is client-specific. The server uses the [official MCP Python SDK v1](https://py.sdk.modelcontextprotocol.io/v1/).
 
 ## Opt-in Git checkpoints
 
@@ -333,7 +338,7 @@ This also removes records committed after `COMMIT`. Files that were never commit
 | `src/temporal_memory_os/store.py` | Markdown records, change detection, SQLite index, bitemporal resolution, corrections |
 | `src/temporal_memory_os/retrieval.py` | Snapshot-first keyword, embedding and link retrieval with rank fusion |
 | `src/temporal_memory_os/extraction.py` | Rule-based extraction and the approval queue with stale-preview checks |
-| `src/temporal_memory_os/models.py` | Fact validation, UTC normalization, safe topic paths |
+| `src/temporal_memory_os/models.py` | Fact validation, UTC normalization, name comparison, safe topic paths |
 | `src/temporal_memory_os/{cli,api,mcp_server,git_history}.py` | JSON CLI, optional HTTP API, read-only MCP tools, opt-in Git checkpoints |
 | `tests/` | Behavioral and property-based tests, including a reference model of the time rules |
 | `benchmarks/` | Accuracy and scale benchmarks, their JSON reports and the charts above |
@@ -353,7 +358,7 @@ Each layer catches a different kind of mistake. CI runs every layer except mutat
 | Property-based tests | Random histories of adds, corrections, retractions and searches, compared after every step with an independent reference model of the time rules, including which writes must be rejected and why. Also: time normalization ordering, Markdown round-trips of arbitrary text, and extraction of arbitrary structured lines |
 | Coverage | Branch coverage, including the CLI's child processes; CI fails below 90% (see the dated validation record for the current measurement) |
 | Types | `mypy` with every function annotated and all bodies checked |
-| Mutation testing | Breaks the core modules one small change at a time (3,983 mutants in the 0.2.3 review) and checks that some test fails |
+| Mutation testing | Breaks the core modules one small change at a time (4,569 mutants in the 0.3.1 review) and checks that some test fails |
 | Benchmarks | Exact-version retrieval against baselines and latency as the store grows; CI fails if accuracy changes or a chart no longer matches its report |
 
 ```sh
@@ -365,12 +370,14 @@ python benchmarks/run.py --entities 50 --check --output benchmark-results.json
 python benchmarks/scale.py --sizes 300 1000 --output benchmark-results-scale.json
 python benchmarks/plot.py --check
 
-# Mutation testing (about 25 minutes on a 12-core laptop; macOS or Linux;
+# Mutation testing (about an hour on a 12-core laptop; macOS or Linux;
 # run it from a folder that a cloud drive does not sync)
 python -m pip install -e '.[mutation]'
 HYPOTHESIS_PROFILE=mutation mutmut run
 python tools/mutation_summary.py
 ```
+
+In the run on version 0.3.1, tests caught 4,187 of 4,569 mutants; 375 survived, 6 ran out of time and one was stopped because it never finishes. Every survivor has a reviewed verdict: 198 are equivalent, 157 change only an error message or a similar detail, 10 matter only on a case-sensitive file system, 8 only add work and 2 change a cache's size limit. The review of the code changed for 0.3.1 found 23 mutants that no test caught, most of them in the exact text of messages this release added or reworded; tests added in this release catch all 23.
 
 In the historical run on version 0.2.3, tests caught 3,642 of 3,983 mutants (91.4%); 340 survived and one crashed the test process. Of the survivors, 162 only change the wording of an error message or the letter case of an SQL keyword, which the tests deliberately do not pin; without them the score is 95.3%. Every other survivor was reviewed one by one against the 0.2.3 code, including those already reviewed for 0.2.2, and a second reviewer tried to refute each verdict. 127 are equivalent: no input can tell them apart from the original, for example a codec name in capitals, which Python matches case-insensitively, or a check on a branch that earlier validation rules out. 41 change only an error message's wording, a temporary file's name or a cache's size limit. The other 10 are caught on a case-sensitive file system, as on CI's Linux runners; on macOS, where the run took place, a folder name in another letter case names the same folder. Each review added tests for behavior no earlier test checked, most of them in `tests/*_pins.py`; in 0.2.3, 17 tests catch 31 mutants that had survived. The 0.2.2 mutation review, with an adversarial check of its fixes, found 22 edge-case bugs; the 0.2.3 mutation review found one, in a fix made during this release, and it was corrected before publishing (see the changelog).
 

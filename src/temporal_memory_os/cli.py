@@ -10,6 +10,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .models import _AS_OF_HELP, _DATE_ALONE, _KNOWN_AT_HELP
+
+# The commands that create a missing memory directory (git-init does too). Every
+# other command reports it, so a folder that was moved or renamed is never
+# replaced by an empty one, not even by a write.
+_CREATING = ("init", "demo")
+_RESPELLED = ("Recorded as {} / {}, the spelling memory already uses for these names "
+              "(letter case, Unicode compatibility forms and spacing do not count)")
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="memoryos", description="Editable temporal AI memory")
@@ -21,8 +30,10 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("entity")
     add.add_argument("attribute")
     add.add_argument("value")
-    add.add_argument("--from", dest="valid_from")
-    add.add_argument("--to", dest="valid_to")
+    add.add_argument("--from", dest="valid_from",
+                     help="When the fact became true (default: now). " + _DATE_ALONE)
+    add.add_argument("--to", dest="valid_to",
+                     help="When it stopped being true (default: still true). " + _DATE_ALONE)
     add.add_argument("--source", default="manual")
     add.add_argument("--evidence", default="")
     add.add_argument("--confidence", type=float, default=1.0)
@@ -31,8 +42,8 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--topic", default="general")
     search = commands.add_parser("search", help="Retrieve facts valid at a point in time")
     search.add_argument("query")
-    search.add_argument("--as-of")
-    search.add_argument("--known-at")
+    search.add_argument("--as-of", help=_AS_OF_HELP)
+    search.add_argument("--known-at", help=_KNOWN_AT_HELP)
     search.add_argument("--limit", type=int, default=5)
     search.add_argument("--entity")
     search.add_argument("--mode", choices=["keyword", "semantic", "graph", "hybrid"],
@@ -40,7 +51,7 @@ def _parser() -> argparse.ArgumentParser:
     history = commands.add_parser("history", help="Show the effective timeline for an entity")
     history.add_argument("entity")
     history.add_argument("--attribute")
-    history.add_argument("--known-at")
+    history.add_argument("--known-at", help=_KNOWN_AT_HELP)
     correct = commands.add_parser("correct", help="Correct a fact with an auditable new revision")
     correct.add_argument("id")
     correct.add_argument("value")
@@ -55,7 +66,9 @@ def _parser() -> argparse.ArgumentParser:
     content.add_argument("--file", type=Path)
     content.add_argument("--text")
     extract.add_argument("--source", required=True)
-    extract.add_argument("--observed-at")
+    extract.add_argument("--observed-at",
+                         help="When the text was written, the date of lines without one "
+                              "(default: now). " + _DATE_ALONE)
     extract.add_argument("--topic", default="general")
     proposals = commands.add_parser("proposals", help="Inspect the approval queue")
     proposals.add_argument("--status", choices=["pending", "approved", "rejected", "all"],
@@ -70,8 +83,8 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("mcp", help="Run the optional read-only MCP stdio server")
     agent = commands.add_parser("agent", help="Ask through the optional Claude Agent SDK")
     agent.add_argument("question")
-    agent.add_argument("--as-of")
-    agent.add_argument("--known-at")
+    agent.add_argument("--as-of", help=_AS_OF_HELP)
+    agent.add_argument("--known-at", help=_KNOWN_AT_HELP)
     agent.add_argument("--model")
     agent.add_argument("--max-turns", type=int, default=8)
     agent.add_argument("--max-budget-usd", type=float, default=0.5)
@@ -88,13 +101,9 @@ def _execute(args: argparse.Namespace) -> Any:
     # An empty --root (say, from an unset shell variable) is treated as if it
     # were not given, like an empty MEMORYOS_HOME: never the working directory.
     location = args.root or os.environ.get("MEMORYOS_HOME") or "./memory-data"
-    root = Path(location).expanduser().resolve()
-    if args.command == "agent":
-        import asyncio
-        from .agent import ask
-        return asyncio.run(ask(root, args.question, as_of=args.as_of, known_at=args.known_at,
-                               model=args.model, max_turns=args.max_turns,
-                               max_budget_usd=args.max_budget_usd, timeout=args.timeout))
+    # Servers open the store for each request, which resolves links then: a --root
+    # that is a link re-pointed after a move is followed without a restart.
+    served = Path(location).expanduser().absolute()
     if args.command == "serve":
         if not 0 <= args.port <= 65535:
             raise ValueError("--port must be between 0 and 65535")
@@ -112,12 +121,20 @@ def _execute(args: argparse.Namespace) -> Any:
                 print("Note: requests must name localhost as their host; add the names other "
                       "clients use to MEMORYOS_ALLOWED_HOSTS. This check is not access "
                       "control: only the token is.", file=sys.stderr)
-        uvicorn.run(create_app(root), host=args.host, port=args.port)
+        uvicorn.run(create_app(served), host=args.host, port=args.port)
         return None
     if args.command == "mcp":
         from .mcp_server import run_server
-        run_server(root)
+        run_server(served)
         return None
+    from .store import MemoryStore, _resolved_root
+    root = _resolved_root(location)
+    if args.command == "agent":
+        import asyncio
+        from .agent import ask
+        return asyncio.run(ask(root, args.question, as_of=args.as_of, known_at=args.known_at,
+                               model=args.model, max_turns=args.max_turns,
+                               max_budget_usd=args.max_budget_usd, timeout=args.timeout))
     if args.command in ("git-init", "checkpoint", "git-log"):
         from .git_history import GitHistory
         history = GitHistory(root)
@@ -126,15 +143,19 @@ def _execute(args: argparse.Namespace) -> Any:
         if args.command == "checkpoint":
             return history.checkpoint(args.message)
         return history.log(args.limit)
-    from .store import MemoryStore
     # Only an explicit reindex may set a damaged index aside (see MemoryStore).
-    with MemoryStore(root, repair_index=args.command == "reindex") as store:
+    with MemoryStore(root, repair_index=args.command == "reindex",
+                     create=args.command in _CREATING) as store:
         if args.command == "init":
             return {"root": str(root), "facts": len(store.all_facts())}
         if args.command == "add":
             fields = ("entity", "attribute", "value", "valid_from", "valid_to", "source",
                       "evidence", "confidence", "tags", "links", "topic")
-            return store.add(**{name: getattr(args, name) for name in fields}).to_dict()
+            fact = store.add(**{name: getattr(args, name) for name in fields})
+            if (fact.entity, fact.attribute) != (args.entity, args.attribute):
+                print(json.dumps({"note": _RESPELLED.format(fact.entity, fact.attribute)},
+                                 ensure_ascii=False), file=sys.stderr)
+            return fact.to_dict()
         if args.command == "search":
             from .retrieval import HybridRetriever
             return [result.to_dict() for result in HybridRetriever(store).search(

@@ -306,7 +306,7 @@ def test_damage_that_leaves_unreadable_text_is_reported_and_repaired(tmp_path, d
     with MemoryStore(tmp_path) as memory:
         fact = memory.add("person", "drink", "tea", valid_from="2025-01-01")
     damage(tmp_path)
-    with pytest.raises(StoreIntegrityError, match="memoryos reindex"):
+    with pytest.raises(StoreIntegrityError, match="memoryos --root <memory directory> reindex"):
         MemoryStore(tmp_path)
     with MemoryStore(tmp_path, repair_index=True) as repaired:
         assert repaired.get(fact.id).value == "tea"
@@ -333,8 +333,10 @@ def test_damaged_index_raises_store_integrity_error_and_is_left_in_place(tmp_pat
         message = str(caught.value)
         assert message == (
             "The index .memoryos/index.sqlite3 is damaged ({}). Stop other programs using this "
-            "memory directory and run `memoryos reindex` to rebuild it from the Markdown "
-            "records.".format(cause))
+            "memory directory, then rebuild the index from the Markdown records by running "
+            "reindex with --root set to this memory directory (the same --root or "
+            "MEMORYOS_HOME used to open it), for example "
+            "`memoryos --root <memory directory> reindex`.".format(cause))
         # Only an explicit repair renames files that other processes may have open.
         assert set_aside(tmp_path) == []
         assert (tmp_path / ".memoryos" / "index.sqlite3").exists()
@@ -1833,6 +1835,7 @@ def test_mcp_empty_memoryos_home_uses_the_default_folder(tmp_path, monkeypatch):
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEMORYOS_HOME", "")
+    (tmp_path / "memory-data").mkdir()  # The MCP server never creates the memory directory.
 
     async def scenario(session, _initialized):
         result = await session.call_tool("memory_history", {"entity": "Alex"})

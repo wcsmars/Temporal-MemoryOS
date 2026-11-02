@@ -19,7 +19,9 @@ from helpers import approved_city, Python310Datetime
 import temporal_memory_os.extraction as extraction
 from temporal_memory_os.extraction import ProposalQueue
 from temporal_memory_os.models import Fact, normalize_time
-from temporal_memory_os.store import MemoryConflictError, MemoryStore
+from temporal_memory_os.store import (
+    MemoryConflictError, MemoryStore, MissingMemoryDirectoryError,
+)
 
 
 @pytest.fixture
@@ -68,14 +70,15 @@ def test_creation_times_step_forward_within_one_clock_tick_on_python_310(store, 
 # Queue setup
 
 
-def test_queue_recreates_its_folder_when_the_workspace_folder_was_removed(tmp_path):
-    """Opening a queue creates the proposal folder together with any missing parent folders."""
+def test_queue_reports_a_workspace_folder_removed_after_the_store_opened(tmp_path):
+    """Opening a queue creates only the proposal folder. A memory directory removed
+    since the store opened is reported (0.3.1), not made again around a new queue."""
     root = tmp_path / "workspace"
     with MemoryStore(root) as store:
         shutil.rmtree(root)
-        queue = ProposalQueue(store)
-        assert queue.directory.is_dir() and (root / "proposals").is_dir()
-        assert queue.list(status="all") == [] and queue.problems == []
+        with pytest.raises(MissingMemoryDirectoryError):
+            ProposalQueue(store)
+    assert not root.exists()
 
 
 def test_a_new_queue_reports_no_problems_before_listing(store):
@@ -509,7 +512,8 @@ def test_proposal_set_back_to_pending_by_hand_is_approved_again_with_its_own_fac
 # ==========================================================================
 
 
-@pytest.mark.parametrize("other_entity", ["office", "User"])
+# "User" is the same entity as "user" since 0.3.1; an accent still makes another name.
+@pytest.mark.parametrize("other_entity", ["office", "us\u00e9r"])
 def test_newer_predecessor_is_expected_when_another_entity_shares_the_attribute(
         store, queue, other_entity):
     """Another entity's value for the same attribute does not make an in-order approval stale."""
@@ -625,3 +629,49 @@ def test_a_value_restated_after_a_new_rival_in_the_same_text_is_new(queue):
     assert [proposal.value for proposal in result] == ["London", "Paris"]
     assert result[1].id != paris.id
     assert len(queue.list()) == 3
+
+
+def test_a_line_keeps_a_spelling_that_a_queued_proposal_already_uses(queue, ticking_clock):
+    """Proposals queued before 0.3.1 can spell a name memory does not have yet in several
+    ways. A new line in one of those spellings keeps it, and is approved as written; a
+    line in a spelling no proposal uses takes that of the oldest proposal."""
+    # Queued by 0.3.0, which kept each line's spelling, before this test's clock starts.
+    for number, line in enumerate(["Alex | City | Paris | 2026-01-01",
+                                   "alex | city | Rome | 2026-02-01"], start=1):
+        entity, attribute, value, day = line.split(" | ")
+        old = extraction.Proposal(
+            id="{:032x}".format(number), entity=entity, attribute=attribute, value=value,
+            valid_from=normalize_time(day), source="chat", evidence=line, topic="general",
+            created_at=normalize_time("2025-12-0{}".format(number)), confidence=1.0)
+        (queue.directory / (old.id + ".json")).write_text(json.dumps(old.to_dict()),
+                                                          encoding="utf-8")
+    [oslo] = queue.extract("alex | city | Oslo | 2026-03-01", source="chat")
+    assert (oslo.entity, oslo.attribute) == ("alex", "city")
+    [nice] = queue.extract("ALEX | CITY | Nice | 2026-04-01", source="chat")
+    assert (nice.entity, nice.attribute) == ("Alex", "City")
+    approved = queue.approve(oslo.id)
+    assert (approved.entity, approved.attribute) == ("alex", "city")
+
+
+def test_a_retracted_target_is_a_change_beside_an_older_record_named_none(tmp_path):
+    """The record a preview showed was retracted, so approval says memory changed.
+    Having no record to show is not a record ID: a record whose ID is "None" is not
+    named as one the preview missed."""
+    with MemoryStore(tmp_path) as store:
+        # A hand-written record about something else, whose ID is "None", recorded long ago.
+        record = Fact(id="None", entity="sam", attribute="pet", value="cat",
+                      valid_from="2020-01-01", source="notes", recorded_at="2020-01-01")
+        folder = tmp_path / "memory" / "general"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "None.md").write_text(MemoryStore._render(record), encoding="utf-8")
+        store.refresh()
+        old = store.add("e", "a", "x", valid_from="2020-01-01", source="chat")
+        queue = ProposalQueue(store)
+        [proposal] = queue.extract("2022-01-01: e | a | y", source="chat")
+        assert (proposal.kind, proposal.target_id) == ("update", old.id)
+        store.retract(old.id)
+        before = store.all_facts()
+        with pytest.raises(MemoryConflictError, match="^Memory changed since this proposal"):
+            queue.approve(proposal.id)
+        assert store.all_facts() == before
+        assert queue.get(proposal.id).status == "pending"

@@ -1252,7 +1252,7 @@ class UntextedDamage:
 def test_damage_reported_without_any_text_still_gets_the_repair_hint(tmp_path, monkeypatch):
     MemoryStore(tmp_path).close()
     monkeypatch.setattr(MemoryStore, "_connect", lambda self: UntextedDamage())
-    with pytest.raises(StoreIntegrityError, match="memoryos reindex"):
+    with pytest.raises(StoreIntegrityError, match="memoryos --root <memory directory> reindex"):
         MemoryStore(tmp_path)
 
 
@@ -1310,3 +1310,34 @@ def test_a_link_scans_as_the_placeholder_signature(store, tmp_path, folder):
     name = "attachments" if folder else "linked.md"
     (store.memory_dir / name).symlink_to(outside, target_is_directory=folder)
     assert store._scan()["memory/" + name] == (-1, -1)
+
+
+def test_repair_of_damage_found_while_reading_stops_when_the_reopened_index_is_damaged(
+        tmp_path, monkeypatch):
+    """Index text that is not UTF-8 passes the page check and shows up only when opening
+    reads it. Such an index is set aside once; if a damaged file is back in its place
+    when the index is reopened, the repair stops with the damage report and leaves that
+    file alone, as it does for damage the page check finds."""
+    with MemoryStore(tmp_path) as store:
+        store.add("person", "drink", "tea", valid_from="2025-01-01")
+    with closing(sqlite3.connect(str(_index(tmp_path)))) as connection:
+        connection.execute("UPDATE sources SET path = CAST(x'ff' AS TEXT)")
+        connection.commit()
+        assert connection.execute("PRAGMA quick_check").fetchall() == [("ok",)]  # The premise.
+    planted = b"recreated by another program " * 100
+    real, calls = MemoryStore._set_aside, []
+
+    def set_aside_then_a_damaged_file_reappears(self):
+        real(self)
+        calls.append(1)
+        if len(calls) == 1:
+            self.db_path.write_bytes(planted)
+
+    monkeypatch.setattr(MemoryStore, "_set_aside", set_aside_then_a_damaged_file_reappears)
+    with pytest.raises(StoreIntegrityError,
+                       match="memoryos --root <memory directory> reindex") as caught:
+        MemoryStore(tmp_path, repair_index=True)
+    assert "(file is not a database)" in str(caught.value)  # The reopened file's damage.
+    assert len(calls) == 1
+    assert _index(tmp_path).read_bytes() == planted
+    assert len({name.rsplit(".corrupt-", 1)[1] for name in _set_aside_names(tmp_path)}) == 1

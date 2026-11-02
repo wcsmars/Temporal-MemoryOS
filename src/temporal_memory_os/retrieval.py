@@ -18,7 +18,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Protocol, Sequ
 
 from .embeddings import (STOPWORDS, Embedder, EmbeddingUnavailableError, create_embedder,
                          normalized_tokens, tokenize)
-from .models import Fact, TimeInput
+from .models import Fact, TimeInput, name_key
 
 Ranking = List[Tuple[str, float]]
 # Dimensions, indices of non-zero values (None when stored densely), values,
@@ -31,9 +31,8 @@ MAX_KEYWORD_TERMS = 64
 _FTS_TOKENIZER = "unicode61 remove_diacritics 2 categories 'L* N* Co M*'"
 
 
-def _name(text: str) -> str:
-    """Comparable form of an entity name or link: NFKC, case-folded, trimmed."""
-    return unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", text).casefold()).strip()
+# Entity names and links compare as the store compares names.
+_name = name_key
 
 
 @lru_cache(maxsize=65536)
@@ -334,6 +333,11 @@ class HybridRetriever:
         self, query: str, as_of: TimeInput = None, known_at: TimeInput = None, limit: int = 5,
         mode: str = "hybrid", entity: Optional[str] = None,
     ) -> List[SearchResult]:
+        """Rank the facts in effect at ``as_of``, using knowledge recorded by ``known_at``.
+
+        Both default to now; a date alone means 00:00 UTC at the start of that day,
+        not the whole day. ``entity`` keeps one entity, in any spelling (see name_key).
+        """
         if not isinstance(query, str):
             raise ValueError("query must be a string")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
@@ -489,9 +493,11 @@ class HybridRetriever:
         (quotes, brackets and trailing punctuation around them are allowed). A
         name with no word characters seeds only when written out as a word.
         """
-        query_tokens = set(tokenize(query))
+        # Words come from name keys, so a name's words do not depend on which of its
+        # spellings came last ("İstanbul" and "Istanbul" are one name, see name_key).
+        query_tokens = set(tokenize(_name(query)))
         written = _QueryWords(query)
-        entities = {_name(fact.entity): frozenset(tokenize(fact.entity)) for fact in facts}
+        entities = {_name(fact.entity): frozenset(tokenize(_name(fact.entity))) for fact in facts}
         seeds = {entity for entity, tokens in entities.items()
                  if (tokens and tokens <= query_tokens) or (not tokens and written.write(entity))}
         groups: Dict[frozenset, List[str]] = {}

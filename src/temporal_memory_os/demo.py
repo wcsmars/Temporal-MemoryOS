@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from .models import name_key
 from .store import MemoryConflictError, MemoryStore
 
 
@@ -34,14 +35,16 @@ def seed_demo(store: MemoryStore) -> Dict[str, Any]:
              valid_from="2026-08-01", recorded_at="2026-08-01T09:00:00Z",
              topic="profile/location", tags=["location"]),
     ]
-    # Check the immutable audit records, not the latest state, for repeat runs.
+    # Check the immutable audit records, not the latest state, for repeat runs. Names
+    # compare as in the store: a record may have joined a history spelled otherwise.
     existing = {
-        (f.entity, f.attribute, f.value, f.valid_from[:10])
+        (name_key(f.entity), name_key(f.attribute), f.value, f.valid_from[:10])
         for f in store.all_facts() if f.source == DEMO_SOURCE
     }
     added, skipped = [], []
     for record in records:
-        key = (record["entity"], record["attribute"], record["value"], record["valid_from"])
+        key = (name_key(record["entity"]), name_key(record["attribute"]), record["value"],
+               record["valid_from"])
         if key in existing:
             continue
         try:
