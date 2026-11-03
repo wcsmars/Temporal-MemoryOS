@@ -107,5 +107,6 @@ only_mutate = [
   "src/temporal_memory_os/embeddings.py",
 ]
 pytest_add_cli_args_test_selection = ["tests/"]
-# Tests of the benchmark scripts and tools load them from these folders.
-also_copy = ["benchmarks", "tools"]
+# Tests of the benchmark scripts and tools load them from these folders, and
+# tests/test_docs_examples.py reads the documentation.
+also_copy = ["benchmarks", "tools", "docs", "README.md", "CHANGELOG.md"]

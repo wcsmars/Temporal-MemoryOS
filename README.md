@@ -112,24 +112,28 @@ memoryos add "Acme application" status "interview invited" \
 
 memoryos history "Acme application" --attribute status
 memoryos search "Acme application status" --as-of 2026-09-10
+memoryos list
 memoryos correct FACT_ID "interview scheduled" --source "conversation:correction"
 memoryos retract NEW_ID --source "conversation:retraction"
+memoryos list --all
 ```
 
 Replace `FACT_ID` with an ID returned by a command, and `NEW_ID` with the ID that `correct` returned: only the latest revision of a record can be corrected or retracted. `correct` keeps the original effective date and creates a new revision. Use `add` with a later `--from` when the world changes. A retraction removes that assertion from resolved snapshots; it is **not deletion of the audit record**.
 
-Entity and attribute names ignore letter case, Unicode compatibility forms (such as full-width letters) and extra spaces: `User`, `USER` and `user` with spaces around it are one entity, and `Favourite drink` and `favourite DRINK` one attribute. Accents still count. Each record keeps the spelling it was written with, and `add` (also `MemoryStore.add()` and `POST /api/facts`) files a new record under the spelling memory already uses for the same names, so it continues that history, and returns it in that spelling; the CLI also says so on standard error when it changes the names you typed. Case folding follows Unicode, so `Straße` matches `STRASSE`, and a few recently added characters fold differently on older Python versions.
+`list` shows every fact true now, the snapshot that `GET /api/facts` returns, sorted by entity and attribute in Unicode code-point order (A to Z, then a to z, then accented and other letters: `Zed`, `alex`, `zoe`, `Émile`); `--as-of` and `--known-at` work as they do for `search`, and `--entity` keeps one entity. `list --all` shows every saved record instead, each one Markdown file: facts that ended or start later, corrected versions and retractions too. Its records are grouped by entity and attribute in the same order, and for each pair come in the order of their start, each followed by the revisions that replaced it. They keep the ends they were stored with, while `list` and `history` end a value where the next one starts. With `--known-at`, `--all` keeps only the records recorded by then; without it, every record is listed, even one recorded after now, as an imported record can be. `MemoryStore.records()` returns the same records in Python.
+
+Entity and attribute names ignore letter case, Unicode compatibility forms (such as full-width letters) and extra spaces: `User`, `USER` and `user` with spaces around it are one entity, and `Favourite drink` and `favourite DRINK` one attribute. Accents still count. Each record keeps the spelling it was written with, and `add` (also `MemoryStore.add()` and `POST /api/facts`) files a new record under the spelling memory already uses for the same names, so it continues that history, and returns it in that spelling; the CLI also says so on standard error when it changes the names you typed. Case folding follows Unicode, so `Straße` matches `STRASSE`. Case folding and compatibility forms both come from the running Python's Unicode data, and a few recently added characters compare differently on older Python versions, so a store written by an older Python version than the one reading it can still spell a name several ways, as can one written before 0.3.1 or edited by hand. `list` places such a pair where the spelling that sorts first goes among the records known by its cutoff (now by default), shown or not, and `list --all` with the same `--known-at` places it there too; without `--known-at`, `--all` also counts records recorded after now. One entity's pairs can therefore be apart; `--entity` lists them together.
 
 For knowledge history, pass a separate cutoff. The demo's records carry the dates they were learned, so this works on the demo directory:
 
 ```sh
 memoryos --root ./memory-data search "Alex preferred drink" \
-  --as-of 2026-10-10 --known-at 2026-10-01 --limit 1    # tea: the change was not known yet
+  --as-of 2026-10-10 --known-at 2026-10-01 --limit 1
 memoryos --root ./memory-data search "Alex preferred drink" \
-  --as-of 2026-10-10 --limit 1                          # decaf coffee
+  --as-of 2026-10-10 --limit 1
 ```
 
-The demo learned on 5 October that Alex's drink had changed, so a query limited to what was known on 1 October still answers tea. Corrections work the same way: one learned in October changes the retrospective answer for September, but cannot appear in a query restricted to knowledge available in September. Records entered with `add` are learned now, so a `--known-at` earlier than today excludes them; an importer can supply `recorded_at` through the Python API. Both query times default to now. Times are `YYYY-MM-DD`, optionally followed by `THH:MM`, seconds, up to six fractional digits, and `Z` or `+HH:MM`; the same strings are accepted on every supported Python version. Offsets are normalized to UTC, and a time without `Z` or an offset is read as UTC too. A date alone means 00:00 UTC at the start of that day, not the whole day and not local time: at UTC+8, `--known-at 2026-11-01` stops at 08:00 local time and leaves out anything recorded later that day. To cover a whole local day, give a time with an offset, such as `2026-11-01T23:59:59.999999+08:00`, or leave the option out to mean now. Date arguments are explicit: the engine does not infer dates from the question text.
+The demo learned on 5 October that Alex's drink had changed, so the first query, limited to what was known on 1 October, still answers tea; the second, without `--known-at`, answers decaf coffee. Corrections work the same way: one learned in October changes the retrospective answer for September, but cannot appear in a query restricted to knowledge available in September. Records entered with `add` are learned now, so a `--known-at` earlier than today excludes them; an importer can supply `recorded_at` through the Python API. Both query times default to now. Times are `YYYY-MM-DD`, optionally followed by `THH:MM`, seconds, up to six fractional digits, and `Z` or `+HH:MM`; the same strings are accepted on every supported Python version. Offsets are normalized to UTC, and a time without `Z` or an offset is read as UTC too. A date alone means 00:00 UTC at the start of that day, not the whole day and not local time: at UTC+8, `--known-at 2026-11-01` stops at 08:00 local time and leaves out anything recorded later that day. To cover a whole local day, give a time with an offset, such as `2026-11-01T23:59:59.999999+08:00`, or leave the option out to mean now. Date arguments are explicit: the engine does not infer dates from the question text.
 
 ## Extract with human review
 
@@ -214,13 +218,17 @@ The optional agent delegates model calls and tool execution to the official
 Temporal MemoryOS supplies its three read-only MCP tools: search, fetch, and history.
 There is no custom model/tool execution loop.
 
+The command after the install asks for your Anthropic API key at a hidden prompt and exports it only in this shell; skip it if your environment already exports the key. It ends its block because in a shell without bracketed paste, such as the bash that ships with macOS, the prompt discards any lines pasted after it. An optional `.env` file is ignored by Git, but is not loaded automatically.
+
 ```sh
 python -m pip install -e '.[agent]'
-# Enter the key at the hidden prompt; it is exported only in this shell.
-ANTHROPIC_API_KEY="$(python -c 'import getpass; print(getpass.getpass("Anthropic API key: "))')"
-export ANTHROPIC_API_KEY
-# Skip these two lines if your environment already exports the key.
-# An optional .env file is ignored by Git, but is not loaded automatically.
+ANTHROPIC_API_KEY="$(python -c 'import getpass; print(getpass.getpass("Anthropic API key: "))')" \
+  && export ANTHROPIC_API_KEY
+```
+
+Then ask about the demo memory:
+
+```sh
 memoryos --root ./memory-data demo
 memoryos --root ./memory-data agent "What was the Acme application status?" \
   --as-of 2026-09-10 --known-at 2026-09-20
@@ -259,9 +267,10 @@ The SDK tests run offline; live synthetic validation is recorded separately in
 
 ## HTTP API
 
+The `MEMORYOS_API_TOKEN` line sets an optional bearer token, required when exposing the API to other users.
+
 ```sh
 python -m pip install -e '.[api]'
-# Optional bearer token, required when exposing the API to other users:
 export MEMORYOS_API_TOKEN='choose-a-local-token'
 memoryos --root ./memory-data serve
 ```
@@ -306,12 +315,11 @@ Tools are `search`, `fetch`, and `memory_history`. They are read-only; changes h
 
 ## Opt-in Git checkpoints
 
-Choose a separate private directory **outside any other repository**; `git-init` refuses a directory that is already a repository it did not create:
+Choose a separate private directory **outside any other repository**; `git-init` refuses a directory that is already a repository it did not create. Skip the two `git config` lines if Git already has an identity, set globally or in that repository:
 
 ```sh
 memoryos --root /absolute/path/to/private-memory init
 memoryos --root /absolute/path/to/private-memory git-init
-# If no Git identity is configured (globally or in this repository), set one here.
 git -C /absolute/path/to/private-memory config user.name "Your Name"
 git -C /absolute/path/to/private-memory config user.email "you@example.com"
 memoryos --root /absolute/path/to/private-memory checkpoint --message "Review initial memory"
@@ -320,11 +328,10 @@ memoryos --root /absolute/path/to/private-memory git-log
 
 Checkpoints use the identity configured in Git (globally or in that repository) or Git's author and committer environment variables, and refuse to run without one; Git is never allowed to guess one from the account name and hostname. Repository-location variables such as `GIT_DIR` are ignored, so a checkpoint always goes to the memory directory's own repository. A checkpoint waits for in-flight writes and approvals, so it never captures an approved proposal without its fact; while it runs, searches continue and writes wait (up to 30 seconds, so a process writing continuously can make a checkpoint fail; retry it). No remote is created and nothing is pushed. Checkpoints only commit memory and proposal changes, excluding locks, temporary files, editor backups (`notes.md~`, `#notes.md#`) and derived indexes; your personal Git ignore file does not apply to them. A repository you created yourself is used only after you mark it with `git -C <memory directory> config memoryos.checkpoints true`. Git retains prior contents: retraction is not secure erasure. Use synthetic data in public repositories and keep your personal store private.
 
-To restore a checkpoint, stop anything using the store, bring both folders back to the same commit, then rebuild the index:
+To restore a checkpoint, stop anything using the store, bring both folders back to the same commit, then rebuild the index. Skip the `proposals` line if no proposal was ever checkpointed (Git then reports that `proposals` matched no file):
 
 ```sh
 git -C /absolute/path/to/private-memory restore --source=COMMIT --staged --worktree -- memory
-# Skip the next line if no proposal was ever checkpointed (Git then reports that `proposals` matched no file).
 git -C /absolute/path/to/private-memory restore --source=COMMIT --staged --worktree -- proposals
 memoryos --root /absolute/path/to/private-memory reindex
 ```
@@ -361,25 +368,29 @@ Each layer catches a different kind of mistake. CI runs every layer except mutat
 | Mutation testing | Breaks the core modules one small change at a time (4,569 mutants in the 0.3.1 review) and checks that some test fails |
 | Benchmarks | Exact-version retrieval against baselines and latency as the store grows; CI fails if accuracy changes or a chart no longer matches its report |
 
+`pytest -q --cov` runs the full test suite with a coverage report and fails below 90%.
+
 ```sh
 python -m pip install -e '.[api,mcp,agent,dev]'
-pytest -q --cov          # full test suite, coverage report and 90% floor
+pytest -q --cov
 ruff check .
 mypy
 python benchmarks/run.py --entities 50 --check --output benchmark-results.json
 python benchmarks/scale.py --sizes 300 1000 --output benchmark-results-scale.json
 python benchmarks/plot.py --check
+```
 
-# Mutation testing (about an hour on a 12-core laptop; macOS or Linux;
-# run it from a folder that a cloud drive does not sync)
+Mutation testing takes about an hour on a 12-core laptop and runs on macOS or Linux; run it from a folder that a cloud drive does not sync:
+
+```sh
 python -m pip install -e '.[mutation]'
 HYPOTHESIS_PROFILE=mutation mutmut run
 python tools/mutation_summary.py
 ```
 
-In the run on version 0.3.1, tests caught 4,187 of 4,569 mutants; 375 survived, 6 ran out of time and one was stopped because it never finishes. Every survivor has a reviewed verdict: 198 are equivalent, 157 change only an error message or a similar detail, 10 matter only on a case-sensitive file system, 8 only add work and 2 change a cache's size limit. The review of the code changed for 0.3.1 found 23 mutants that no test caught, most of them in the exact text of messages this release added or reworded; tests added in this release catch all 23.
+In the run on version 0.3.1, tests caught 4,187 of 4,569 mutants; 375 survived, 6 ran out of time and one was stopped because it never finishes. Every survivor has a reviewed verdict: 198 are equivalent, 157 change only an error message or a similar detail, 10 matter only on a case-sensitive file system, 8 only add work and 2 change a cache's size limit. The review of the code changed for 0.3.1 found 23 mutants that no test caught, most of them in the exact text of messages 0.3.1 added or reworded; tests added in 0.3.1 catch all 23.
 
-In the historical run on version 0.2.3, tests caught 3,642 of 3,983 mutants (91.4%); 340 survived and one crashed the test process. Of the survivors, 162 only change the wording of an error message or the letter case of an SQL keyword, which the tests deliberately do not pin; without them the score is 95.3%. Every other survivor was reviewed one by one against the 0.2.3 code, including those already reviewed for 0.2.2, and a second reviewer tried to refute each verdict. 127 are equivalent: no input can tell them apart from the original, for example a codec name in capitals, which Python matches case-insensitively, or a check on a branch that earlier validation rules out. 41 change only an error message's wording, a temporary file's name or a cache's size limit. The other 10 are caught on a case-sensitive file system, as on CI's Linux runners; on macOS, where the run took place, a folder name in another letter case names the same folder. Each review added tests for behavior no earlier test checked, most of them in `tests/*_pins.py`; in 0.2.3, 17 tests catch 31 mutants that had survived. The 0.2.2 mutation review, with an adversarial check of its fixes, found 22 edge-case bugs; the 0.2.3 mutation review found one, in a fix made during this release, and it was corrected before publishing (see the changelog).
+In the historical run on version 0.2.3, tests caught 3,642 of 3,983 mutants (91.4%); 340 survived and one crashed the test process. Of the survivors, 162 only change the wording of an error message or the letter case of an SQL keyword, which the tests deliberately do not pin; without them the score is 95.3%. Every other survivor was reviewed one by one against the 0.2.3 code, including those already reviewed for 0.2.2, and a second reviewer tried to refute each verdict. 127 are equivalent: no input can tell them apart from the original, for example a codec name in capitals, which Python matches case-insensitively, or a check on a branch that earlier validation rules out. 41 change only an error message's wording, a temporary file's name or a cache's size limit. The other 10 are caught on a case-sensitive file system, as on CI's Linux runners; on macOS, where the run took place, a folder name in another letter case names the same folder. Each review added tests for behavior no earlier test checked, most of them in `tests/*_pins.py`; in 0.2.3, 17 tests catch 31 mutants that had survived. The 0.2.2 mutation review, with an adversarial check of its fixes, found 22 edge-case bugs; the 0.2.3 mutation review found one, in a fix made during that release, and it was corrected before publishing (see the changelog).
 
 See [the validation record](docs/validation.md) and the [changelog](CHANGELOG.md). The benchmarks measure exact-version retrieval and latency, not generated answer accuracy.
 

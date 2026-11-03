@@ -5,9 +5,11 @@ Three scripts, all offline: no model downloads, API calls, or personal data. Eac
 ```sh
 python benchmarks/run.py --entities 50 --check --output benchmarks/results/synthetic-50.json
 python benchmarks/scale.py --output benchmarks/results/scale-current.json
-python benchmarks/plot.py           # Rewrites the SVG charts from the JSON reports.
-python benchmarks/plot.py --check   # Writes nothing; fails if a chart no longer matches its report.
+python benchmarks/plot.py
+python benchmarks/plot.py --check
 ```
+
+`plot.py` rewrites the SVG charts from the JSON reports; with `--check` it writes nothing and fails if a chart no longer matches its report.
 
 ## Exact-version retrieval (`run.py`)
 
@@ -55,10 +57,10 @@ Every search result, warm or cold, is checked for the expected entity, value and
 
 ### The 0.1 baseline
 
-`results/scale-v0.1.json` was measured from the unreleased 0.1 source, which is not part of this repository. Its raw report is included unchanged. It was produced with `--use-installed`, which benchmarks whatever `temporal_memory_os` is importable instead of `./src`:
+`results/scale-v0.1.json` was measured from the unreleased 0.1 source, which is not part of this repository. Its raw report is included unchanged. It was produced with `--use-installed`, which benchmarks whatever `temporal_memory_os` is importable instead of `./src`. Set `OLD_PACKAGE_FOLDER` to the folder that holds the 0.1 package first; without it the command stops with a message:
 
 ```sh
-PYTHONPATH=<folder holding the 0.1 package> \
+PYTHONPATH="${OLD_PACKAGE_FOLDER:?set it to the folder that holds the 0.1 package}" \
   python benchmarks/scale.py --use-installed --label v0.1 --output benchmarks/results/scale-v0.1.json
 ```
 

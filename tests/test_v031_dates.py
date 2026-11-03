@@ -5,6 +5,7 @@ A date alone means 00:00 UTC, which is 08:00 at UTC+8. A fact added there at
 assistant answers with the older value.
 """
 
+import argparse
 import json
 import re
 
@@ -193,15 +194,21 @@ def test_http_api_whole_local_day_cutoff_works_with_plus_written_as_2b(memory):
     assert [fact["value"] for fact in date_alone.json()["facts"]] == ["tea"]
 
 
-@pytest.mark.parametrize("command, options", [
+TIME_OPTIONS = [
     ("search", {"--as-of AS_OF": AS_OF, "--known-at KNOWN_AT": KNOWN_AT}),
     ("history", {"--known-at KNOWN_AT": KNOWN_AT}),
+    ("list", {"--as-of AS_OF": AS_OF,  # 0.3.2
+              "--known-at KNOWN_AT": KNOWN_AT + " With --all, leaving it out lists every "
+                                                "record."}),
     ("agent", {"--as-of AS_OF": AS_OF, "--known-at KNOWN_AT": KNOWN_AT}),
     ("add", {"--from VALID_FROM": "When the fact became true (default: now). " + ALONE,
              "--to VALID_TO": "When it stopped being true (default: still true). " + ALONE}),
     ("extract", {"--observed-at OBSERVED_AT": "When the text was written, the date of lines "
                                               "without one (default: now). " + ALONE}),
-])
+]
+
+
+@pytest.mark.parametrize("command, options", TIME_OPTIONS)
 def test_cli_time_options_state_the_rule(capsys, command, options):
     with pytest.raises(SystemExit) as stopped:
         cli.main([command, "--help"])
@@ -211,3 +218,16 @@ def test_cli_time_options_state_the_rule(capsys, command, options):
     shown = "".join(re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out).split())
     for option, text in options.items():
         assert "".join(option.split()) + "".join(text.split()) in shown, option
+
+
+def test_every_cli_time_option_is_checked_above():
+    """A command or option added later that takes a time must join TIME_OPTIONS (0.3.2:
+    list was missing at first)."""
+    commands = next(action for action in cli._parser()._actions
+                    if isinstance(action, argparse._SubParsersAction)).choices
+    timed = {(name, option) for name, parser in commands.items()
+             for action in parser._actions for option in action.option_strings
+             if action.dest in ("as_of", "known_at", "valid_from", "valid_to", "observed_at")}
+    checked = {(name, option.split()[0]) for name, options in TIME_OPTIONS
+               for option in options}
+    assert timed == checked

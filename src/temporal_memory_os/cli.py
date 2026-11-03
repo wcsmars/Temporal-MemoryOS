@@ -40,6 +40,17 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--tag", dest="tags", action="append", default=[])
     add.add_argument("--link", dest="links", action="append", default=[])
     add.add_argument("--topic", default="general")
+    listing = commands.add_parser(
+        "list", help="List every fact true at a point in time, or with --all every saved record")
+    when = listing.add_mutually_exclusive_group()
+    when.add_argument("--as-of", help=_AS_OF_HELP)
+    when.add_argument("--all", action="store_true",
+                      help="List every saved record instead, each one Markdown file: facts that "
+                           "ended or start later, corrected versions and retractions too")
+    listing.add_argument("--known-at", help=_KNOWN_AT_HELP + " With --all, leaving it out "
+                                            "lists every record.")
+    listing.add_argument("--entity", help="Only this entity (letter case, Unicode "
+                                         "compatibility forms and spacing do not count)")
     search = commands.add_parser("search", help="Retrieve facts valid at a point in time")
     search.add_argument("query")
     search.add_argument("--as-of", help=_AS_OF_HELP)
@@ -156,6 +167,11 @@ def _execute(args: argparse.Namespace) -> Any:
                 print(json.dumps({"note": _RESPELLED.format(fact.entity, fact.attribute)},
                                  ensure_ascii=False), file=sys.stderr)
             return fact.to_dict()
+        if args.command == "list":
+            shown = (store.records(known_at=args.known_at, entity=args.entity) if args.all
+                     else store.snapshot(as_of=args.as_of, known_at=args.known_at,
+                                         entity=args.entity))
+            return [fact.to_dict() for fact in shown]
         if args.command == "search":
             from .retrieval import HybridRetriever
             return [result.to_dict() for result in HybridRetriever(store).search(
@@ -203,12 +219,31 @@ def _message(error: Exception) -> str:
     return str(error)
 
 
+def _drop_output() -> None:
+    # Point standard output at the null device, so what Python still holds back is
+    # dropped at exit instead of waiting for the reader or reporting a closed pipe.
+    try:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    except (OSError, ValueError):  # A standard output with no file behind it.
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         result = _execute(args)
-        if result is not None:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
+        # sys.stdout is None when the command was started with its output closed (>&-).
+        if result is not None and sys.stdout is not None:
+            try:
+                # Flushed inside the guard: Python holds back some output (up to 128 KiB
+                # from Python 3.14 on) and reports a closed pipe only when it writes it.
+                print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+            except BrokenPipeError:  # The reader, such as head or a pager, stopped early.
+                _drop_output()
+                return 141  # The status a shell gives a command stopped this way.
+            except KeyboardInterrupt:  # Ctrl-C while writing, as when a pager shows it.
+                _drop_output()
+                return 130
         return 0
     except KeyError as exc:
         missing = exc.args[0] if exc.args else ""

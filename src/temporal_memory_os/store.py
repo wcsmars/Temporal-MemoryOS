@@ -1186,9 +1186,55 @@ class MemoryStore:
         position = {fact.id: index for index, fact in enumerate(ordered)}
         return sorted(ordered, key=lambda fact: (fact.recorded_at, position[fact.id]))
 
-    def _visible(self, known: str, entity: Optional[str] = None,
+    def records(self, known_at: TimeInput = None, entity: Optional[str] = None) -> List[Fact]:
+        """Every stored record, each one Markdown file: facts that ended or start later,
+        superseded revisions and retraction tombstones included.
+
+        Each entity and attribute pair is one group, with every spelling of its names
+        (see name_key). A group is placed where the smallest spelling among the records
+        returned sorts, in code-point order (A to Z before a to z, then other letters),
+        as ``snapshot`` with the same ``known_at`` places its facts. ``snapshot`` counts
+        every record known by then, shown or not, and defaults ``known_at`` to now, so
+        without ``known_at`` a record recorded later can place a group elsewhere here.
+        The groups of an entity stored under several spellings can therefore be apart;
+        ``entity`` lists them together. Within a group, records come in the order
+        of their effective starts, each followed by the revisions that superseded it, in
+        order, even one recorded at the same instant; of two spellings that share a start,
+        the one recorded first comes first (on equal times, the smaller ID). ``known_at``
+        keeps only the records recorded by then (a date alone means 00:00 UTC at the start
+        of that day); without it every record is returned, even one imported with a
+        recording time ahead of the clock. ``entity`` keeps one entity, under every
+        spelling of its name. Ends are returned as stored; ``snapshot`` and ``history``
+        also end a value where the next one starts.
+        """
+        visible = self._visible(None if known_at is None else normalize_time(known_at), entity)
+        following = {fact.supersedes: fact for fact in visible if fact.supersedes is not None}
+        # A revision keeps its target's names and start and is never recorded before it,
+        # so each visible chain of revisions begins with a visible record that revises
+        # nothing. Those records are grouped by names compared by name_key, each group
+        # placed where its smallest spelling sorts, as _timeline places its timelines.
+        groups: Dict[Tuple[str, str], List[Fact]] = {}
+        for fact in visible:
+            if fact.supersedes is None:
+                key = (name_key(fact.entity), name_key(fact.attribute))
+                groups.setdefault(key, []).append(fact)
+        ordered: List[Fact] = []
+        for firsts in groups.values():
+            for fact in sorted(firsts, key=lambda fact: (fact.valid_from, fact.recorded_at,
+                                                         fact.id)):
+                ordered.append(fact)
+                while fact.id in following:
+                    fact = following[fact.id]
+                    ordered.append(fact)
+        return ordered
+
+    def _visible(self, known: Optional[str], entity: Optional[str] = None,
                  attribute: Optional[str] = None) -> List[Fact]:
-        clauses, parameters = ["recorded_at <= ?"], [known]
+        clauses: List[str] = []
+        parameters: List[str] = []
+        if known is not None:  # None: every record, however recorded (see records).
+            clauses.append("recorded_at <= ?")
+            parameters.append(known)
         with self._lock:
             # Every stored spelling of the names (see name_key).
             entities, attributes = self._spellings(entity, attribute)
@@ -1198,8 +1244,9 @@ class MemoryStore:
             if attribute is not None:
                 clauses.append("attribute IN ({})".format(_marks(attributes)))
                 parameters.extend(attributes)
+            where = " WHERE " + " AND ".join(clauses) if clauses else ""
             rows = self.connection.execute(
-                "SELECT id, payload FROM facts WHERE " + " AND ".join(clauses)
+                "SELECT id, payload FROM facts" + where
                 + " ORDER BY entity, attribute, valid_from, recorded_at, id", parameters).fetchall()
             return [self._fact(row) for row in rows]
 
@@ -1210,8 +1257,9 @@ class MemoryStore:
         # still sees every revision that could supersede a visible record.
         superseded = {fact.supersedes for fact in visible if fact.supersedes is not None}
         # One timeline per name_key pair, so records under other spellings of the names
-        # (hand edits, releases before 0.3.1) join it. Rows arrive grouped by exact
-        # names in sorted order, which is also the order of the timelines.
+        # (hand edits, releases before 0.3.1, an older Python's Unicode data) join it.
+        # Rows arrive grouped by exact names in sorted order, which is also the order of
+        # the timelines.
         groups: Dict[Tuple[str, str], List[Fact]] = {}
         joined = set()
         names: Optional[Tuple[str, str]] = None
@@ -1272,7 +1320,7 @@ class MemoryStore:
                 known_at: TimeInput = None) -> List[Fact]:
         """Return the effective timeline, including retracted intervals.
 
-        Superseded revisions remain available through ``get``/``all_facts``;
+        Superseded revisions remain available through ``get``/``records``;
         history shows the timeline as it was known at the requested cutoff
         (default now; a date alone means 00:00 UTC at the start of that day).
         Records under other spellings of the names (see name_key) share one
